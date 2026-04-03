@@ -102,7 +102,7 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 4000,
+        max_tokens: 6000,
         system: PDF_PARSE_PROMPT,
         messages: [{ role: 'user', content: `Bank statement text:\n\n${text}` }],
       }),
