@@ -49,19 +49,23 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 const PDF_PARSE_PROMPT = `You are a bank statement parser. The user will give you raw text extracted from a bank statement PDF.
 Your job is to find every transaction and return them as a JSON array.
 
-IMPORTANT: Some Irish bank PDFs (especially PTSB/Permanent TSB) use custom font encoding, so the extracted text may appear garbled or scrambled. Look for patterns:
-- Dates often appear as short codes at the start of lines (e.g. "[ +" or month abbreviations like "ãáâ" or "( ê")  
-- Transaction lines follow a repeating pattern with merchant names and amounts
-- Numbers for amounts are usually readable even when text is garbled
-- Look for currency symbols (€, £) and numeric patterns to identify amounts
-- The column structure is usually: Date | Description | Withdrawn | Paid In | Balance
+IMPORTANT: PTSB/Permanent TSB bank PDFs use custom font encoding so text appears garbled. The pattern is consistent:
+- Lines starting with "[ +" are January transactions, "ãáâ" = February, "( ê" = March, "( ê" = March etc. These are date prefixes.
+- "è.+" means "T/F" (transfer/payment)
+- "î&&" means "VPP" (Visa/card payment)  
+- "&!ë" means "POS" (point of sale)
+- "ñäè" means "ICT" (credit transfer)
+- "àà" means "DD" (direct debit)
+- Common merchants decode as: "èáëä! ëè!êáë" = Tesco Stores, "êÁÎ?%ÍÈ" = Revolut, "àá<ñîáê!!" = Deliveroo, "& ààß &!ïáê" = Paddy Power, "äñêä<á" = Circle K, "(ää âáë &ç ê" = McDonald's, "[ÍËÈ á/È ñÊÁ" = Just Eat Ireland, "ëäêñââ<áë" = Scramblers, "!âêñá+ë" = O'Briens, "ãêáá+!ï" = Freshway, "ëÈ/ÊÂÍÄÇs" = Starbucks
+- Amounts are in the Withdrawn/Paid In columns and are usually readable numbers
+- The statement date prefix tells you the month — look for year in the statement header
 
-Even with garbled text, try your best to extract dates, merchant names, and amounts. For merchant names use whatever text appears in the description column even if partially garbled.
+Even with garbled text, extract all transactions. Use the decoded merchant names where possible, or use the garbled text as-is if you cannot decode it.
 
 Each transaction object must have exactly these fields:
-- date: string in YYYY-MM-DD format (or YYYY-MM-DD HH:MM:SS if time is available)
-- description: string — merchant or payee name as it appears
-- amount: number — negative for debits/spending, positive for credits/income
+- date: string in YYYY-MM-DD format
+- description: string — decoded merchant name if possible, otherwise raw text
+- amount: number — negative for debits/withdrawals, positive for credits/paid in
 
 Return ONLY a valid JSON array, no other text, no markdown, no explanation.
 If you cannot find any transactions, return an empty array [].
