@@ -49,30 +49,315 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 const PDF_PARSE_PROMPT = `You are a bank statement parser. The user will give you raw text extracted from a bank statement PDF.
 Your job is to find every transaction and return them as a JSON array.
 
-IMPORTANT: PTSB/Permanent TSB bank PDFs use custom font encoding so text appears garbled. The pattern is consistent:
-- Lines starting with "[ +" are January transactions, "ãáâ" = February, "( ê" = March, "( ê" = March etc. These are date prefixes.
-- "è.+" means "T/F" (transfer/payment)
-- "î&&" means "VPP" (Visa/card payment)  
-- "&!ë" means "POS" (point of sale)
-- "ñäè" means "ICT" (credit transfer)
-- "àà" means "DD" (direct debit)
-- Common merchants decode as: "èáëä! ëè!êáë" = Tesco Stores, "êÁÎ?%ÍÈ" = Revolut, "àá<ñîáê!!" = Deliveroo, "& ààß &!ïáê" = Paddy Power, "äñêä<á" = Circle K, "(ää âáë &ç ê" = McDonald's, "[ÍËÈ á/È ñÊÁ" = Just Eat Ireland, "ëäêñââ<áë" = Scramblers, "!âêñá+ë" = O'Briens, "ãêáá+!ï" = Freshway, "ëÈ/ÊÂÍÄÇs" = Starbucks
-- Amounts are in the Withdrawn/Paid In columns and are usually readable numbers
-- The statement date prefix tells you the month — look for year in the statement header
+IMPORTANT: PTSB/Permanent TSB bank PDFs use custom font encoding so text appears garbled. Use this decoding table:
 
-Even with garbled text, extract all transactions. Use the decoded merchant names where possible, or use the garbled text as-is if you cannot decode it.
+MONTH PREFIXES (first token on each transaction line):
+"[ +" = Jan, "ãáâ" = Feb, "( ê" = Mar, " &ê" = Apr, "( ß" = May, "[í+" = Jun, "[í<" = Jul, " íå" = Aug, "ëá&" = Sep, "!ÄÈ" = Oct, "+?Î" = Nov, "àÁÄ" = Dec
 
-Each transaction object must have exactly these fields:
-- date: string in YYYY-MM-DD format
-- description: string — decoded merchant name if possible, otherwise raw text
-- amount: number — negative for debits/withdrawals, positive for credits/paid in
+TRANSACTION TYPE CODES (second token):
+"è.+" or "è/+" = T/F (bank transfer)
+"î&&" or "î &" = VPP (Visa card payment)
+"&!ë" = POS (contactless/card)
+"ñäè" = ICT (incoming credit transfer)
+"àà" = DD (direct debit)
+"åâ&" = GBP (UK payment)
+"íëà" = USD (US payment)
+"êÈÀ" = RTD (return/refund)
+"äè" = CT (credit transfer)
 
-Return ONLY a valid JSON array, no other text, no markdown, no explanation.
-If you cannot find any transactions, return an empty array [].
+MERCHANT DECODING TABLE (match these patterns in the Details column):
+"èáëä! ëè!êáë" = Tesco Stores
+"êÁÎ?%ÍÈ" = Revolut
+"àá<ñîáê!!" = Deliveroo
+"& ààß &!ïáê" = Paddy Power
+"äñêä<á . êñä" = Circle K Richmond
+"äñêä<á . <!ï" = Circle K Law
+"äñêä<á . ïáë" = Circle K Wes
+"äñêä<á . [í+" = Circle K Jun
+"äñêä<á . (  " = Circle K M
+"äñêä<á ." = Circle K
+"(ää âáë &ç ê" = McDonald's
+"[ÍËÈ á/È ñÊÁ" = Just Eat Ireland
+"ëäêñââ<áë" = Scramblers
+"!âêñá+ë ç +à" = O'Briens
+"ãêáá+!ï" = Freshway
+" &&<áä!(âñ" = Apple.com
+" &&<áåêáá+ (" = AppleGreen
+" &&<á ëè!êá" = Apple Store
+"ëè/êâíä.ë" = Starbucks
+"(Äå?Ï/>Ë" = McGowan's
+"(å&îÑ>ÈÁÀ" = MGP Vinted
+"àà åä êá &<í(" = DD GC RE PLUM
+"àà â!êà å ñë áñêá ++" = DD Bord Gais Eireann
+"àà îñêåñ+ (áàñ  ñêá< +à" = DD Virgin Media Ireland
+"ñäè [?Ç> â?X%Á" = ICT John Boyle (income)
+"ñäè [!ç+ â!ß<á" = ICT John Boyle (income)
+"[í< [!ç+ â!ß<á !â ì+" = Jun John Boyle (income)
+"ä/ËÇ á/Ê>ÁÀ" = Cash Earned (interest)
+"áÌø%?ÊÁ (?>ÈÇ%" = Explore Monthly Fee
+"àÁÂÑÈ ä/ÊÀ äÇ/ÊÅÁ" = Debit Card Charge
+"êÈÀ àÑÊÁÄÈ àÁÂÑÈ" = Direct Debit Refund
+"êÈÀ àà äÇ/ÊÅÁ" = DD Charge Refund
+"áíê!ë& ê ã ñ" = EuroSpar
+"( äá ê çá+ß" = McDermott Kenny
+"( äá àêí(ä!+" = McDermott Drumcondra
+"( äá âáèèßëè" = McDermott Bettystown
+"( äá ë +àß(!" = McDermott Sandy
+" <àñ ëè!êáë" = Aldi Stores
+"<ñà< ñêá< +à" = Lidl Ireland
+"+áèã<ñì ñ+èá" = Netflix
+"(ÑÄÊ?Ë?ÃÈ" = Microsoft/Xbox
+"áì&êáëëî&+ä" = ExpressVPN
+"ä!ñ+ ä!ñ+â ëá" = Coinbase
+"íâáê  á è" = Uber Eats
+"íâáê á èë" = Uber Eats
+"íâáê èêñ&" = Uber Trip
+"íâáê êñàáë" = Uber Rides
+"âñ+ +äáä!(" = Bun n Cheese
+"ë& ê ç!<<ßïá" = Spar Hollywell
+"ë& ê à (á ëè" = Spar Drumcondra
+"ë& ê (áêêñ!+" = Spar Merrion
+"âíë ëè!&  å" = Bus Stop
+"èçá ñ+èáê+ è" = The Internet Cafe
+"äÍë/Ä,ë <?Í>" = Cusacks Lounge
+"ëí(í& ëèá&" = Sumup Steak
+"à ß âêá ." = Daybreak
+"à ßâêá . ! ä" = Daybreak OC
+"(í<<ñå +ë &í" = Mulligans Pub
+"ñ>Ë?_>Ñ/ àÊÍ" = Insomnia Drumcondra
+"äê ââß [!ë" = Crabby Jos
+" î!ä  ç +àïá" = Avoca
+"ãñââáê ( åáá" = Fibber Magees
+"!ÎÁÊÀÊ ãÈ ãÁÁ" = Overdraft Fee
+"< åíá<áíè!+" = L Gueuleton
+"âíè<áêë äç!ä" = Butlers Chocolate
+".ãä ïáëè(!êá" = KFC Westmoreland
+" êâ!êáèí(" = Arboretum
+"ñêñëç ê ñ< ç" = Irish Rail
+"(äë!ê<áßë" = McCharleys
+"(á( ë" = Memos
+"ëé ß ( (!êñ" = Sq By Mori
+"ã< ñåçè ä<íâ" = Flight Club
+"á ëß ãíá<" = Easy Fuel
+"!à?>?ÅÇÍÁË" = O Donoghues
+" à ïë!+ ëè" = Dawson Street
+"å/ÃÃ>Á" = Gaffneys
+"à!(ñ+!ë &ñ]" = Dominos Pizza
+"èê& áîá+èë" = TRP Events
+"+ß î/øÁÂ/Ê" = NY Vapebar
+"èçá åá!êåá" = The George
+"â< ä.âñêà ê" = Blackbird Restaurant
+"è!+áêë &íâ" = Toners Pub
+"è ëèß å êàá+" = Tasty Garden
+"äç &èáêë â!!" = Chapters Bookstore
+"[!ç+ . î + å" = John V Ning
+"èçá â <à á å" = The Bald Eagle
+".[è îÁ>ÀÑ>Å" = JKT Vending
+"ËÇÁÑ>Ä?_" = Shein
+"ç!(á ëè!êá" = Home Store
+"ëá  åêááàßä!" = Sea Greedy Co
+"è êåáè" = Target
+"çíàë?> ëè" = Hudson St
+" &&<á ëè!êá" = Apple Store
+"ñç!&" = iHop
+"ëè êâíä.ë" = Starbucks
+"ëé èçá äá<è" = Sq The Delta
+"åñ+ & < äá" = Gun and Castle
+"( äá âáèèßëè" = McDe Bettystown
+"äñ+áï!ê<à" = Cineworld
+"â!+!â!" = Bonomi
+"ã!å êèßë ëç!" = Fogarty Shoes
+"ëé èçá âñå" = Sq The Big (venue)
+"êñ!è" = Riot Bar
+"(äåê èè +ë ê" = McGrotty ns
+"èÊÍÁÈ/%Á>È:" = TrueTalent
+"+Í_ÂÁÊ  +ÁÏ" = Number One New
+"çñä.áßë &ç ê" = Hickeys Pharmacy
+".á++áàßë &íâ" = Kennedys Pub
+"ëí&áêàêíå ëè" = Superdrug
+"èíèçñ<<ë ñ<" = Tuthills
+"&á++áßë ( êß" = Penneys Primark
+"ä  ê!ñ í%" = CA Roi UL (ATM)
+" ä ê!ñ í%" = CA Roi UL (ATM)
+"â á>ÈÁÊÈ" = B Entertainment
+"ëçßë ä!ëèäí" = Shays Costcu
+"ààáã á>ÈÁÊÈ" = DDEF Entertainment
+"ëí&áê  ëñ  &" = Super Si P
+"äá+èê  & ê+á" = Centre Parne
+"ëí(í& å <" = Sumup GL
+"ëé  âë!<íèá" = Sq Absolute Gym
+"ëé èê äáë" = Sq Trades
+"ëé î &áîá+à" = Sq V Weekend
+"ëí(í& èçá" = Sumup The
+"( ê. ã <ä!+á" = Mr Falcone
+"äè ñêñëç <ñãá çá <èç" = CT Irish Life Health
+"äè ä?>ÎÁÊ/ í. <ÈÀ" = CT Convera UK Ltd
+"ï??ÀÑÁË  ÑÊë" = Woodies IRS
+"äÊÁøÁë />À Ï" = Crepes and Waffles
+"(/Ç/ÊÅ á>ÈÁÊ" = Maharaj
+"<!íåç !ïá< !" = Lough Owel
+"èÊÑÂÁ ã??À ä" = Tribe Food Co
+"ëé ê!!ëèáêë" = Sq Roosters Barber
+"! êáñ<<ßë ë" = O Reillys
+"àñ (!+à &ñ]]" = Du Mond Pi
+"!<à ëäç!!<ç!" = Old Schoolhouse
+"+ß îÁ>À_?ÊÁ" = NY Vendmore
+"àÁÄ/ÈÇ%?> !Ä" = Decathlon
+"ëé &!à ãáëè" = Sq Pod Fest
+"ëé à îáë äá" = Sq D Ves De
+"ëé &!à ãáëè" = Sq Pod Festival
+"(Á_/Ë" = Memas Cafe
+"ãÊ/>ÄÑë ?¦?" = Francois Restaurant
+"ëí(í& è ìñ" = Sumup Taxi
+"âíêåáê .ñ+å" = Burger King
+"ëí(í& &çñ<" = Sumup Phil
+"áë&ñêá < âë" = Espire Labs
+"&á++áßë ! ä!" = Penneys OC
+"äá+èê  àêí(ä" = Centre Drumcondra
+"äá+èê  àêí(ä" = Centre Drumcondra
+"äá+èê  à!êëá" = Centre Dorset
+"( äá âáèèßëè" = McDermott Bettystown
+"ãñââáê ( åáá" = Fibber Magees
+"ïçá< +ë" = Wheels
+"äç ê<ñáë ã" = Charlies
+"ì< ïñä.<!ï ë" = XL Wicklow St
+"ë ( (ä.]ß" = S M McKby
+"èçá <ñèè<á å" = The Little G
+"ãÁÂ [/> ä/ËÇ" = Feb Jan Cash
+"/Ë/Ñ%X" = Asailly
+"!êä  " = ORC
+"ëé &!à ãáëè" = Sq Pod Fest
+"ëé èçá âñå" = Sq The Bug
+"çáàñå +ë èçá" = Hedigan The (pub)
+"ëé ë( (ä.]ß" = Sq SM McKby
+"ãñââáê ( åáá" = Fibber Magees
+"ëé & ï+ ëç!" = Sq Win Sho
+"ã<ñåçè ä<íâ" = Flight Club
+"& ß& < ñèí+" = PBOL ITION (online)
+"& ß& < íâáê" = PBOL Uber
+"ïïï ( ]!+" = WWW MJON (online)
+" (]+&ÊÑ_Á àá" = Amazon Prime De
+" ( ]!+ &êñ(á" = Amazon Prime
+"â á+ÈÁÊÈ" = B Entertainment
+"ààáã á>ÈÁÊÈ" = DDF Entertainment
+"âã á>ÈÁÊÈ" = BF Entertainment
+"áââ  á>ÈÁÊÈ" = EBB Entertainment
+" ää  ê!ñ í%" = ACC Roi UL
+"ä  ê!ñ í%" = CA Roi UL
+"+ß äÑÊÄ%Á ." = NY Circle
+"ëé & ï+ ëç!" = Sq Win Sho (Square payment terminal)
+"ëé ñèë !íê" = Sq Its Our
+"ëé  âë!<íèá" = Sq Absolute
+"ëé î &áîá+à" = Sq V Weekend
+"ëé âë!<íèá" = Sq Absolute Gym
+" äè ñêñëç <ñãá çá <èç" = CT Irish Life Health
+"ëé & ï+ ëç!" = Sq Win Sho
+"& àà<á+áè" = P Addlenet (PayPal/online)
+"ëé ñèë !íê" = Sq Its Our
+"ãêáá+!ïäáä" = Freshway ED
+"ãêáá+!ïäáä." = Freshway EDE
+"àí++áë çá+êß" = Dunnes Henry St
+"( äá âáèèßëè" = McDermott Bettystown
+"ãêáá+!ïä!" = Freshway A
+"ãêáá+!ïä â" = Freshway AB
+"ãêáá+!ïäâ]" = Freshway AB2
+"ãêáá+!ïäã&" = Freshway FP
+"ãêáá+!ïäîã" = Freshway VF
+"ãêáá+!ïä[ä" = Freshway JC
+"ãêáá+!ïäñïì" = Freshway IWX
+"ãêáá+!ïä(ß" = Freshway MY
+"ãêáá+!ïä!á" = Freshway OE
+"ãêáá+!ïä!ç" = Freshway OH
+"ãêáá+!ïä!ñ" = Freshway OI
+"ãêáá+!ïä!ìä" = Freshway OXC
+"ãêáá+!ïä< å" = Freshway LG
+"ãêáá+!ïä<â" = Freshway LB
+"ãêáá+!ïä< <" = Freshway LL
+"ãêáá+!ïä+ìâ" = Freshway NXB
+"ãêáá+!ïäâí<" = Freshway BUL
+"ãêáá+!ïäâ+" = Freshway BN
+"ãêáá+!ïäî+" = Freshway VN
+"ãêáá+!ïäâß" = Freshway BY
+"ãêáá+!ïäç" = Freshway H
+"ãêáá+!ïäã" = Freshway F
+"ãêáá+!ïä è" = Freshway T
+"ãêáá+!ïäîã" = Freshway VF
+"ãêáá+!ïä(ß" = Freshway MY
+"ãêáá+!ïä ää<" = Freshway CCL
+"ãêáá+!ïä!ìä" = Freshway OXC
+"ãêáá+!ïäñ" = Freshway I
+"ãêáá+!ïäñïì" = Freshway IWX
+"ãêáá+!ï[ã" = Freshway JF
+"ãêáá+!ïäç â" = Freshway HB
+"ãêáá+!ïäâ]" = Freshway AB2
+"ãêáá+!ïäã&" = Freshway FP
+"è.+ ãêáá+!ïä.]" = Freshway
+"ãêáá+!ïä< å" = Freshway
+"ãêáá+!ïäç" = Freshway H
+"ãêáá+!ïäã" = Freshway F
+"ãêáá+!ïä è" = Freshway T
+"ãêáá+!ïäîã" = Freshway
+"ãêáá+!ï ää<" = Freshway CCL
+"ãêáá+!ïä!á" = Freshway OE
+"ãêáá+!ïä!ñ" = Freshway OI
+"ëí(í& ëèá&" = Sumup Steak
+"ëí(í& ë +à" = Sumup Sand
+"ëí(í& +êå" = Sumup NRG
+"ëí(í& äçêñ" = Sumup Chri
+"ëí(í& å <" = Sumup GL
+"ëí(í& &êñß" = Sumup Priy
+"ëí(í& è ìñ" = Sumup Taxi
+"ëí(í& &çñ<" = Sumup Phil
+"ëí(í& áÎÁ>È" = Sumup Event
+"ëí(í& èê&" = Sumup TRC
+"ëí(í& èçá" = Sumup The
+"ëí(í& è ìñ" = Sumup Taxi
+"ëí(í& å <" = Sumup GL
+"ëé & ï+ ëç!" = Sq Win Sho
+"& ê.ë &ç ê(" = A RKS PH RM (pharmacy)
+"äá+èê  à!êëá" = Centre Dorset St
+"â!+!â!" = Bonomi Cafe
+"ëá& è.+ ãêáá+!ïä!ìä" = Freshway
+"(äàñ><àë" = McDonalds
+"<ñà< ñêá< +à" = Lidl Ireland
+"<ñà< ñê" = Lidl
+"<!èèë ä ãá â" = Lotts Cafe Bar
+"åñ+ & < äá" = Gun and Castle
+"åñ+ & < äá" = Gun and Castle
+"& ààß &!ïáê" = Paddy Power
+"ãêáá+!ï ä" = Freshway D
+"ëé &!à ãáëè" = Sq Pod Fest
+"ëé &!à ãáëè" = Sq Pod Fest
+"ëé &!à ãáëè" = Sq Pod Festival
+"ëé &!à ãáëè" = Sq Pod Fest
+"&áèëè!&" = Petstop
+"íâê &á+àñ+å" = Ubr Pending
+"äá+èê  " = Drumcondra Centre
+"& ê.ë &ç ê(" = Arks Pharmacy
+"(äà!+ <àë" = McDonald ALDS
+"ä ãá á+ ëáñ+" = Cafe en Seine
+"è.+  &&<áåêáá+ (ê" = AppleGreen MR
+"ëé &!à ãáëè" = Sq Pod Fest
+"è.+ (!Ç/Êå á>ÈÁÊ" = Maharaj Entertainment
+"á>ÈÁÊÈ" = Entertainment venue
+"ëé ë( (ä.]ß" = Sq SM McKby
+"ãñââáê ( åáá" = Fibber Magees
+"ï/?ÀÑÁË" = Woodies
+"è/ëèß å êàá+" = Tasty Garden
+"ëè êâíä.ë" = Starbucks
+"é í/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Quarterly Interest
+"(/Ê éÍ/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Mar Quarterly Interest
+"[í+ éÍ/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Jun Quarterly Interest
+
+For amounts: look for numeric values after the merchant name. Withdrawn column = negative amount, Paid In column = positive.
+For dates: combine month prefix + day number visible on the line. Use year from statement header.
+
+Return ONLY a valid JSON array. Best-guess merchant names for anything not in the table.
+Return empty array [] only if truly no transactions found.
 
 Example output:
 [
-  {"date":"2025-03-07","description":"Tesco Groceries","amount":-68.40},
+  {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40},
   {"date":"2025-03-31","description":"Salary","amount":2800.00}
 ]`;
 
