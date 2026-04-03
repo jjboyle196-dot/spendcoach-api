@@ -207,6 +207,8 @@ Example output:
 ]`;
 
 app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
+  req.setTimeout(120000); // 2 min timeout for vision requests
+  res.setTimeout(120000);
   const { images } = req.body;
 
   if (!images || !Array.isArray(images) || images.length === 0) {
