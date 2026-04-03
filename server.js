@@ -49,6 +49,15 @@ app.get('/health', (req, res) => res.json({ status: 'ok' }));
 const PDF_PARSE_PROMPT = `You are a bank statement parser. The user will give you raw text extracted from a bank statement PDF.
 Your job is to find every transaction and return them as a JSON array.
 
+IMPORTANT: Some Irish bank PDFs (especially PTSB/Permanent TSB) use custom font encoding, so the extracted text may appear garbled or scrambled. Look for patterns:
+- Dates often appear as short codes at the start of lines (e.g. "[ +" or month abbreviations like "ãáâ" or "( ê")  
+- Transaction lines follow a repeating pattern with merchant names and amounts
+- Numbers for amounts are usually readable even when text is garbled
+- Look for currency symbols (€, £) and numeric patterns to identify amounts
+- The column structure is usually: Date | Description | Withdrawn | Paid In | Balance
+
+Even with garbled text, try your best to extract dates, merchant names, and amounts. For merchant names use whatever text appears in the description column even if partially garbled.
+
 Each transaction object must have exactly these fields:
 - date: string in YYYY-MM-DD format (or YYYY-MM-DD HH:MM:SS if time is available)
 - description: string — merchant or payee name as it appears
@@ -270,4 +279,3 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
-
