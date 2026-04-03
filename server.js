@@ -243,7 +243,7 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 4000,
+        max_tokens: 8000,
         system: PDF_VISION_PROMPT,
         messages: [{ role: 'user', content }],
       }),
@@ -256,8 +256,12 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 
     const data = await response.json();
     const raw = data.content?.[0]?.text || '[]';
-    console.log('Vision images sent:', images.length, 'pages, first image length:', images[0]?.length || 0);
-    console.log('Vision raw response:', raw.slice(0, 500));
+    console.log('Vision images sent:', images.length, 'pages');
+    console.log('Vision raw response length:', raw.length, 'first 200:', raw.slice(0, 200));
+
+    let rows = [];
+    try {
+      const cleaned = raw.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
       if (Array.isArray(parsed)) {
         rows = parsed
