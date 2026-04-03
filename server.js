@@ -245,10 +245,8 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 
     const data = await response.json();
     const raw = data.content?.[0]?.text || '[]';
-
-    let rows = [];
-    try {
-      const cleaned = raw.replace(/```json|```/g, '').trim();
+    console.log('Vision images sent:', images.length, 'pages, first image length:', images[0]?.length || 0);
+    console.log('Vision raw response:', raw.slice(0, 500));
       const parsed = JSON.parse(cleaned);
       if (Array.isArray(parsed)) {
         rows = parsed
@@ -272,3 +270,4 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
+
