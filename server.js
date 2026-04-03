@@ -13,7 +13,7 @@ app.use(cors({
 app.use(express.json({ limit: '64kb' }));
 
 // ── SYSTEM PROMPT ──
-const SYSTEM_PROMPT = `You are SpendCoach, a warm and direct personal finance coach.
+const SYSTEM_PROMPT = `You are Skint, a warm and direct personal finance coach.
 Analyse the user's spending summary and give 2-3 specific, actionable insights in plain conversational language.
 Be direct — mention actual numbers. Flag any obvious issues (e.g. high food delivery, unused subscriptions).
 End with one concrete weekly challenge as a single sentence starting with "Challenge:".
@@ -179,4 +179,4 @@ app.post('/coach', rateLimit, async (req, res) => {
   }
 });
 
-app.listen(PORT, () => console.log(`SpendCoach API running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
