@@ -594,20 +594,45 @@ app.post('/coach', rateLimit, async (req, res) => {
 });
 
 // ── PDF VISION ENDPOINT (for image-based PDFs like PTSB) ──
-const PDF_VISION_PROMPT = `You are a bank statement parser. The user will send you images of bank statement pages.
+const PDF_VISION_PROMPT = `You are a bank statement parser specialising in Irish bank statements, especially PTSB/Permanent TSB.
 Your job is to find every transaction visible in the images and return them as a JSON array.
+
+IMPORTANT: This is a PTSB statement. The printed text on the page is clear and readable. Use exactly what you see.
+Common merchants to recognise from the images:
+- "TESCO STORES" or "TKN TESCO" = Tesco Stores
+- "CIRCLE K" or "TKN CIRCLE K" = Circle K
+- "REVOLUT" or "VPP REVO" = Revolut
+- "DELIVEROO" = Deliveroo
+- "JUST EAT" = Just Eat Ireland
+- "McDONALDS" or "MCD" = McDonald's
+- "PADDY POWER" = Paddy Power
+- "LIDL" = Lidl
+- "ALDI" = Aldi
+- "FRESHWAY" = Freshway
+- "SCRAMBLERS" = Scramblers
+- "O'BRIENS" = O'Briens
+- "UBER" = Uber
+- "AMAZON" = Amazon
+- "NETFLIX" = Netflix
+- "APPLE" = Apple
+- "STARBUCKS" = Starbucks
+- "ICT" prefix = incoming bank transfer
+- "DD" prefix = direct debit
+- "POS" prefix = contactless card payment
+- "VPP" prefix = Visa card payment
+- "TKN" prefix = token/card payment
 
 Each transaction object must have exactly these fields:
 - date: string in YYYY-MM-DD format
-- description: string — merchant or payee name as it appears
-- amount: number — negative for debits/spending, positive for credits/income
+- description: string — merchant name as clearly as possible
+- amount: number — negative for debits/withdrawals, positive for credits/income
 
 Return ONLY a valid JSON array, no other text, no markdown, no explanation.
 If you cannot find any transactions, return an empty array [].
 
 Example output:
 [
-  {"date":"2025-03-07","description":"Tesco Groceries","amount":-68.40},
+  {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40},
   {"date":"2025-03-31","description":"Salary","amount":2800.00}
 ]`;
 
