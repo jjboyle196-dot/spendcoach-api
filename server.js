@@ -4,11 +4,76 @@ const cors = require('cors');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ── SUPABASE ──
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://sqlnvwggsvsbslehaner.supabase.co';
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+
+async function supabaseRequest(path, method = 'GET', body = null) {
+  if (!SUPABASE_KEY) return null;
+  const res = await fetch(`${SUPABASE_URL}/rest/v1${path}`, {
+    method,
+    headers: {
+      'Content-Type': 'application/json',
+      'apikey': SUPABASE_KEY,
+      'Authorization': `Bearer ${SUPABASE_KEY}`,
+      'Prefer': method === 'POST' ? 'resolution=merge-duplicates' : '',
+    },
+    body: body ? JSON.stringify(body) : null,
+  });
+  if (!res.ok) return null;
+  const text = await res.text();
+  return text ? JSON.parse(text) : null;
+}
+
+// Load merchant map from Supabase into memory on startup, refresh every 10 mins
+let merchantCache = {};
+let cacheLastLoaded = 0;
+
+async function getMerchantCache() {
+  const now = Date.now();
+  if (now - cacheLastLoaded < 10 * 60 * 1000 && Object.keys(merchantCache).length > 0) {
+    return merchantCache;
+  }
+  try {
+    const rows = await supabaseRequest('/merchant_map?select=garbled,decoded&limit=5000');
+    if (rows && Array.isArray(rows)) {
+      merchantCache = {};
+      rows.forEach(r => { merchantCache[r.garbled.trim()] = r.decoded; });
+      cacheLastLoaded = now;
+      console.log(`Merchant cache loaded: ${rows.length} entries`);
+    }
+  } catch (e) {
+    console.error('Failed to load merchant cache:', e.message);
+  }
+  return merchantCache;
+}
+
+async function saveMerchantMappings(mappings) {
+  if (!SUPABASE_KEY || !mappings || mappings.length === 0) return;
+  try {
+    // Upsert — if garbled already exists, increment count
+    const rows = mappings.map(m => ({
+      garbled: m.garbled.trim(),
+      decoded: m.decoded.trim(),
+      count: 1,
+      updated_at: new Date().toISOString(),
+    }));
+    await supabaseRequest('/merchant_map', 'POST', rows);
+    // Invalidate cache so next request reloads
+    cacheLastLoaded = 0;
+    console.log(`Saved ${rows.length} merchant mappings`);
+  } catch (e) {
+    console.error('Failed to save merchant mappings:', e.message);
+  }
+}
+
+// Load cache on startup
+getMerchantCache().catch(() => {});
+
 // ── CORS ──
-// In production, replace '*' with your actual Netlify/Capacitor origin
 app.use(cors({
   origin: process.env.ALLOWED_ORIGIN || '*',
-  methods: ['POST', 'OPTIONS'],
+  methods: ['GET', 'POST', 'OPTIONS'],
 }));
 app.use(express.json({ limit: '20mb' }));
 
@@ -44,6 +109,28 @@ function rateLimit(req, res, next) {
 
 // ── HEALTH CHECK ──
 app.get('/health', (req, res) => res.json({ status: 'ok' }));
+
+// ── MERCHANT MAP ENDPOINTS ──
+app.get('/merchant-map', async (req, res) => {
+  const cache = await getMerchantCache();
+  res.json({ map: cache, count: Object.keys(cache).length });
+});
+
+app.post('/merchant-map', async (req, res) => {
+  const { mappings } = req.body;
+  if (!mappings || !Array.isArray(mappings) || mappings.length === 0) {
+    return res.status(400).json({ error: 'Missing mappings array.' });
+  }
+  const clean = mappings.filter(m =>
+    m.garbled && m.decoded &&
+    typeof m.garbled === 'string' &&
+    typeof m.decoded === 'string' &&
+    m.garbled.length < 100 &&
+    m.decoded.length < 100
+  );
+  await saveMerchantMappings(clean);
+  res.json({ saved: clean.length });
+});
 
 // ── PDF PARSE ENDPOINT ──
 const PDF_PARSE_PROMPT = `You are a bank statement parser. The user will give you raw text extracted from a bank statement PDF.
@@ -362,7 +449,7 @@ Example output:
 ]`;
 
 app.post('/parse-pdf', rateLimit, async (req, res) => {
-  const { text } = req.body;
+  const { text, rawLines } = req.body;
 
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'Missing text field.' });
@@ -377,6 +464,15 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
     return res.status(500).json({ error: 'Server configuration error.' });
   }
 
+  // Build prompt — inject community merchant map if available
+  const cache = await getMerchantCache();
+  let communityMappings = '';
+  if (Object.keys(cache).length > 0) {
+    const entries = Object.entries(cache).slice(0, 200); // cap to avoid token overrun
+    communityMappings = '\n\nCOMMUNITY DECODED MERCHANTS (highest priority — use these first):\n' +
+      entries.map(([g, d]) => `"${g}" = ${d}`).join('\n');
+  }
+
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -388,7 +484,7 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 6000,
-        system: PDF_PARSE_PROMPT,
+        system: PDF_PARSE_PROMPT + communityMappings,
         messages: [{ role: 'user', content: `Bank statement text:\n\n${text}` }],
       }),
     });
@@ -401,13 +497,11 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
     const data = await response.json();
     const raw = data.content?.[0]?.text || '[]';
 
-    // Parse the JSON array returned by the AI
     let rows = [];
     try {
       const cleaned = raw.replace(/```json|```/g, '').trim();
       const parsed = JSON.parse(cleaned);
       if (Array.isArray(parsed)) {
-        // Normalise to the format buildSummary expects
         rows = parsed
           .filter(t => t.date && t.description && typeof t.amount === 'number')
           .map(t => ({
@@ -419,6 +513,28 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
     } catch (parseErr) {
       console.error('PDF parse JSON error:', parseErr.message);
       rows = [];
+    }
+
+    // If rawLines provided, extract and save new garbled→decoded mappings
+    if (rawLines && Array.isArray(rawLines) && rows.length > 0) {
+      const newMappings = [];
+      rows.forEach(row => {
+        // Find rawLine that best matches this decoded description
+        rawLines.forEach(line => {
+          const trimmed = line.trim();
+          if (trimmed.length > 4 && !cache[trimmed] && row.description &&
+              row.description.length > 2 && !row.description.includes('???')) {
+            // Only save if description looks properly decoded (not garbled)
+            const hasGarbled = /[ÄÅÁÌÍÎÏÐÑÒÓÔÕÖáâãäåæçèéêëìíîïðñòóôõö]{3,}/.test(row.description);
+            if (!hasGarbled) {
+              newMappings.push({ garbled: trimmed, decoded: row.description });
+            }
+          }
+        });
+      });
+      if (newMappings.length > 0) {
+        saveMerchantMappings(newMappings).catch(() => {});
+      }
     }
 
     res.json({ rows });
