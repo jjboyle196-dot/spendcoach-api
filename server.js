@@ -648,7 +648,7 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
       },
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
-        max_tokens: 8000,
+        max_tokens: 16000,
         system: PDF_VISION_PROMPT,
         messages: [{ role: 'user', content }],
       }),
