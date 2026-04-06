@@ -518,6 +518,20 @@ MERCHANT DECODING TABLE (match these patterns in the Details column):
 For amounts: look for numeric values after the merchant name. Withdrawn column = negative amount, Paid In column = positive.
 For dates: combine month prefix + day number visible on the line. Use year from statement header.
 
+AIB BANK STATEMENT FORMAT:
+AIB statements use readable text with this layout:
+- Date format: "01 Apr 2025" or "01/04/2025"
+- Columns: Date | Details | Debit | Credit | Balance
+- Debit = money out (negative), Credit = money in (positive)
+- Amounts may have commas e.g. "1,234.56" — strip commas before parsing
+- Common AIB transaction prefixes: VDC (Visa debit contactless), VDP (Visa debit purchase), DD (direct debit), CR (credit), TFR (transfer), ATM
+- AIB dates in "DD MMM" format need the year from the statement header
+
+BANK OF IRELAND FORMAT:
+- Date format: DD/MM/YYYY
+- Columns: Date | Details | Debit | Credit | Balance
+- Similar to AIB — readable text, amounts may have commas
+
 Return ONLY a valid JSON array. Best-guess merchant names for anything not in the table.
 Return empty array [] only if truly no transactions found.
 
