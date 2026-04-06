@@ -78,11 +78,15 @@ app.use(cors({
 app.use(express.json({ limit: '20mb' }));
 
 // ── SYSTEM PROMPT ──
-const SYSTEM_PROMPT = `You are Skint, a warm and direct personal finance coach.
-Analyse the user's spending summary and give 2-3 specific, actionable insights in plain conversational language.
-Be direct — mention actual numbers. Flag any obvious issues (e.g. high food delivery, unused subscriptions).
+const SYSTEM_PROMPT = `You are Skint, a sharp and direct Irish personal finance coach.
+Analyse the user's spending and give 2-3 specific, actionable insights in plain conversational language.
+Be direct and a bit blunt — mention actual numbers and specific merchants. 
+Use Irish context where relevant: pints cost €6-9 in Dublin pubs, Tesco/Lidl/Aldi are normal grocers, Circle K is a petrol station.
+If the user has a spending personality type mentioned, reference it naturally once.
+If the user's name is given, use it once near the start.
+If month-on-month data is given, reference whether they improved or got worse.
 End with one concrete weekly challenge as a single sentence starting with "Challenge:".
-Keep the total response under 120 words. No bullet points. Conversational tone.`;
+Keep the total response under 130 words. No bullet points. Conversational Irish tone — not preachy, not American.`;
 
 // ── RATE LIMITING (simple in-memory, resets on restart) ──
 const requestCounts = new Map();
@@ -435,6 +439,81 @@ MERCHANT DECODING TABLE (match these patterns in the Details column):
 "é í/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Quarterly Interest
 "(/Ê éÍ/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Mar Quarterly Interest
 "[í+ éÍ/ÊÈÁÊ%ß ñ>ÈÁÊÁËÈ" = Jun Quarterly Interest
+"&( äë â/Ê" = PM Cas Bar
+"áíê!ë& ê ç +" = EuroSpar North
+"èÇÁ î/øÁ <ÑÃ" = The Vape Life
+"â!!èë êáè ñ<" = Boots Retail
+"ë& ê +!êèç ë" = Spar North Side
+" è( àÍÂ%Ñ>" = ATM Dublin
+"ä ëëñàßë" = Cassidys
+"+ñä!ë è .á" = Nicos Takeaway
+"äè á< ñ+á â!ß<á äí++ñ+åç" = CT Eline Boyle Cunningh
+"ç <á &çñâëâ!" = Hale Phibsboro
+"åê! ê.áë äá+" = Groanrkes Denny
+"çá<á> â!ß<á [[" = Helen Boyle (transfer)
+"&ñáêäá ! è!!<á âñ<<ë" = Pierce OToole Bills
+"ïñåï (" = Wigwam Bar
+"êñîáê â ê" = River Bar
+" ++áë â ê" = Annes Bar
+"èçá ï!ê.( +ë" = The Workmans
+"ãêáá+!ï!íß" = Freshway OUY
+"äê!.á & ê. ë" = Croke Park
+"èçá å èá +áï" = The Gate New
+" âê .áâ âê" = ABR Web BR
+"<<!ßàë&ç ê(" = Lloyds Pharmacy
+"èçá ä è  +à" = The Cat And Dog
+"äï çÁ>ÊX ëÈ" = CW Henry St
+" ëç  ä<!èçñ+" = Asos Clothing
+"&!à ãáëèñî <" = Pod Festival
+"ëî .ñ<( ñ+ç" = SV Kilm Inch
+"èçá âíèè!+ ã" = The Button Factory
+"áÄÑÊÁÈÈÁ" = Ecigarette
+"&ßå( <ñ!+ &í" = Pygmalion Pub
+".ñ+å +íèêñèñ" = King Nutrition
+"<ñ+.áì&êáëë" = Linkexpress
+"èçá çá <èç ë" = The Health Store
+"èçá ïÑ%Á. ã?" = The Wiley Fox
+"(íëñä ãáëèñî" = Music Festival
+"ë& çáàãñè+áë" = SP Headfitness
+"è??å??Àè?å" = Too Good To Go
+"è??å??Àè?å â" = Too Good To Go B
+"ï <ëçë" = Walshes
+"ãêáá+!ïèêë" = Freshway TRS
+"ãêáá+!ïìãà" = Freshway XFD
+"ãêáá+!ïêá" = Freshway RE
+"ãêáá+!ï!íß" = Freshway OUY
+"ãêáá+!ïçî" = Freshway HV
+"ãêáá+!ïxãà" = Freshway XFD
+"èçá <ñîñ+å ê" = The Living Room
+"å?ÈÑ>ÀÁÊÄ?_" = Tinder
+"àáë(!+àë" = Desmonds
+"+áïëê ñ< ä!+" = Newslink Con
+"àá<ñîáê!!" = Deliveroo
+"çí((åê!í&" = Humm Group
+"! êáñ<<ßë ëí" = O Reillys Su
+"ë& ê è <â!è" = Spar Talbot St
+"<íä ! êñ à  êá+è" = Luc O Ri D Rent
+"î&& && !+<ñ+á" = VPP BB Online
+"àà è+à! ãñè+áëë ñêá<" = DD TNDO Fitness Ireland
+"äè ëáè +è  èê +ë(ñëëñ!+ë" = CT Set NT Transmissions
+"âÍ%," = Bulk Wholesale
+"( ì!< ëëè+ ê" = M XOL SSTN R
+"ä ëëñàßë" = Cassidys Pub
+"ëÄÑÊÁÈÈÁ" = Ecigarette
+"çáàñå +ë èçá" = Hedigan The
+"[í+ <íä ! êñ à  êá+è" = Jun Luc O Ri Rent
+"&ñáêäá ! è!!<á âñ<<ë" = Pierce OToole Bills
+" &ê <íä ! êñ à  êá+è" = Apr Luc O Ri Rent
+"( ß <íä ! êñ à  êá+è" = May Luc O Ri Rent
+"( ß çá<á> â!ß<á [[" = May Helen Boyle
+"[í+ &!ë ë& çáàãñè+áë" = Jun SP Headfitness
+"( ìë è .á ï" = M Xst Ke W
+"ä ëëñàßë" = Cassidys
+"ãêáá+!ïèêë" = Freshway TRS
+"&ßå( <ñ!+ &í" = Pygmalion Pub
+"åê! ê.áë äá+" = Groanrkes
+"(äå!ï +ë" = McGowan's
+"ëäêñââ<áë" = Scramblers
 
 For amounts: look for numeric values after the merchant name. Withdrawn column = negative amount, Paid In column = positive.
 For dates: combine month prefix + day number visible on the line. Use year from statement header.
@@ -597,43 +676,42 @@ app.post('/coach', rateLimit, async (req, res) => {
 const PDF_VISION_PROMPT = `You are a bank statement parser specialising in Irish bank statements, especially PTSB/Permanent TSB.
 Your job is to find every transaction visible in the images and return them as a JSON array.
 
-IMPORTANT: This is a PTSB statement. The printed text on the page is clear and readable. Use exactly what you see.
-Common merchants to recognise from the images:
-- "TESCO STORES" or "TKN TESCO" = Tesco Stores
-- "CIRCLE K" or "TKN CIRCLE K" = Circle K
-- "REVOLUT" or "VPP REVO" = Revolut
-- "DELIVEROO" = Deliveroo
-- "JUST EAT" = Just Eat Ireland
-- "McDONALDS" or "MCD" = McDonald's
-- "PADDY POWER" = Paddy Power
-- "LIDL" = Lidl
-- "ALDI" = Aldi
-- "FRESHWAY" = Freshway
-- "SCRAMBLERS" = Scramblers
-- "O'BRIENS" = O'Briens
-- "UBER" = Uber
-- "AMAZON" = Amazon
-- "NETFLIX" = Netflix
-- "APPLE" = Apple
-- "STARBUCKS" = Starbucks
-- "ICT" prefix = incoming bank transfer
-- "DD" prefix = direct debit
-- "POS" prefix = contactless card payment
-- "VPP" prefix = Visa card payment
-- "TKN" prefix = token/card payment
+The statement columns are: Date | Details | Withdrawn | Paid In | Balance
+The Details column has a type prefix then merchant name. Strip the prefix, use only the merchant name.
+Prefixes: TKN, VPP, POS, ICT, DD, CT, RTD, GBP, USD
+
+Examples of how to read each line:
+- "TKN TESCO STORES 1406 2" → description: "Tesco Stores", category: "Groceries"
+- "TKN CIRCLE K 1406 2" → description: "Circle K", category: "Petrol & parking"
+- "VPP REVO REVOLUT*4059" → description: "Revolut", category: "Transfers"
+- "POS PADDY POWER" → description: "Paddy Power", category: "Pubs & bars"
+- "DD BORD GAIS EIREANN" → description: "Bord Gais", category: "Rent & bills"
+- "ICT JOHN BOYLE" → description: "Salary", category: "Income"
+- "POS DELIVEROO" → description: "Deliveroo", category: "Food delivery"
+- "TKN LIDL IRELAND" → description: "Lidl", category: "Groceries"
+- "TKN STARBUCKS" → description: "Starbucks", category: "Coffee"
+- "TKN McDONALDS" → description: "McDonald's", category: "Takeaways"
+- "DD VIRGIN MEDIA" → description: "Virgin Media", category: "Rent & bills"
+- "POS UBER" → description: "Uber", category: "Taxis"
+- "TKN NETFLIX" → description: "Netflix", category: "Subscriptions"
+- "POS BOOTS" → description: "Boots", category: "Health"
+- "TKN JUST EAT" → description: "Just Eat", category: "Food delivery"
+
+Categories to use: Groceries, Food delivery, Takeaways, Pubs & bars, Coffee, Eating out, Taxis, Public transport, Petrol & parking, Travel, Subscriptions, Gaming, Clothing, Health, Fitness, Shopping, Rent & bills, Cash withdrawal, Transfers, Income, Other
 
 Each transaction object must have exactly these fields:
 - date: string in YYYY-MM-DD format
-- description: string — merchant name as clearly as possible
-- amount: number — negative for debits/withdrawals, positive for credits/income
+- description: string — clean merchant name, no prefix, no location codes
+- amount: number — negative for Withdrawn, positive for Paid In
+- category: string — one from the categories list above
 
 Return ONLY a valid JSON array, no other text, no markdown, no explanation.
 If you cannot find any transactions, return an empty array [].
 
 Example output:
 [
-  {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40},
-  {"date":"2025-03-31","description":"Salary","amount":2800.00}
+  {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40,"category":"Groceries"},
+  {"date":"2025-03-31","description":"Salary","amount":2800.00,"category":"Income"}
 ]`;
 
 app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
@@ -700,6 +778,7 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
             date: String(t.date),
             description: String(t.description),
             amount: String(t.amount),
+            ...(t.category ? { category: String(t.category) } : {}),
           }));
       }
     } catch (parseErr) {
@@ -715,3 +794,63 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 });
 
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
+
+// ── SMART CATEGORISE ENDPOINT ──
+app.post('/categorise', rateLimit, async (req, res) => {
+  const { merchants } = req.body;
+  if (!merchants || !Array.isArray(merchants) || merchants.length === 0) {
+    return res.status(400).json({ error: 'Missing merchants array.' });
+  }
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'Server configuration error.' });
+
+  const CATS = ['Groceries','Food delivery','Takeaways','Pubs & bars','Coffee','Eating out','Taxis','Public transport','Petrol & parking','Travel','Subscriptions','Gaming','Clothing','Health','Fitness','Shopping','Rent & bills','Cash withdrawal','Transfers','Income','Other'];
+
+  const prompt = `You are a transaction categoriser for Irish bank statements.
+Given a list of merchant/transaction names, return a JSON object mapping each merchant to its category.
+Use ONLY these categories: ${CATS.join(', ')}
+
+Rules:
+- Mace, Londis, Daybreak = Groceries
+- Sumup/Square/iZettle followed by a word = categorise by what follows (Sumup Taxi = Taxis, Sumup Steak = Eating out)
+- Any pub, bar, nightclub = Pubs & bars
+- Vape shops = Other
+- ATM = Cash withdrawal
+- Revolut = Transfers
+- If genuinely unknown = Other
+
+Return ONLY valid JSON, no markdown. Example:
+{"Mace Drumcondra": "Groceries", "Sumup Taxi": "Taxis"}
+
+Merchants to categorise:
+${merchants.map((m, i) => `${i + 1}. ${m}`).join('\n')}`;
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 1000,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    });
+    if (!response.ok) throw new Error('Anthropic error ' + response.status);
+    const data = await response.json();
+    const raw = data.content?.[0]?.text || '{}';
+    let categories = {};
+    try {
+      categories = JSON.parse(raw.replace(/```json|```/g, '').trim());
+    } catch(e) {
+      console.error('Categorise parse error:', e.message);
+    }
+    res.json({ categories });
+  } catch(err) {
+    console.error('Categorise error:', err.message);
+    res.status(502).json({ error: 'Categorisation temporarily unavailable.' });
+  }
+});
