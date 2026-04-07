@@ -1,5 +1,7 @@
 const express = require('express');
 const cors = require('cors');
+let pdfParse = null;
+try { pdfParse = require('pdf-parse'); } catch(e) { console.warn('pdf-parse not available:', e.message); }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -806,6 +808,182 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
     res.status(502).json({ error: 'Vision PDF parsing temporarily unavailable.' });
   }
 });
+
+// ── PTSB PDF PARSER (no AI needed) ──
+app.post('/parse-ptsb', async (req, res) => {
+  req.setTimeout(30000);
+  const { pdf: pdfBase64, password } = req.body;
+
+  if (!pdfBase64) {
+    return res.status(400).json({ error: 'Missing pdf field.' });
+  }
+
+  if (!pdfParse) {
+    return res.status(500).json({ error: 'pdf-parse not available.', fallback: true });
+  }
+
+  try {
+    const pdfBuffer = Buffer.from(pdfBase64, 'base64');
+    const options = password ? { password } : {};
+    const data = await pdfParse(pdfBuffer, options);
+    const text = data.text || '';
+
+    // Check if this looks like a real PTSB or Irish bank statement
+    // PTSB text PDFs have readable text with dates and amounts
+    const hasDates = /\d{2}[\/-]\d{2}[\/-]\d{2,4}/.test(text) ||
+                     /\d{4}-\d{2}-\d{2}/.test(text) ||
+                     /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i.test(text);
+    const hasAmounts = /[\d,]+\.\d{2}/.test(text);
+    const isGarbled = text.length > 100 &&
+      (text.match(/[ÄÅÁÌÍÎÏÑÒÓÔÕÖáâãäåæçèéêëìíîïðñòóôõö]/g) || []).length > 15;
+
+    // If text is garbled (PTSB scanned PDF) → tell frontend to use vision
+    if (isGarbled || !hasDates || !hasAmounts) {
+      console.log('PTSB PDF: garbled/unreadable text, falling back to vision. Garbled:', isGarbled, 'hasDates:', hasDates, 'hasAmounts:', hasAmounts);
+      return res.json({ rows: [], fallback: true, reason: isGarbled ? 'garbled' : 'no_transactions' });
+    }
+
+    console.log('PTSB PDF: clean text extracted, parsing directly. Text length:', text.length);
+
+    // Parse the text into transaction rows
+    const rows = parseBankStatementText(text);
+    console.log('PTSB PDF: parsed', rows.length, 'rows from text');
+
+    if (rows.length === 0) {
+      return res.json({ rows: [], fallback: true, reason: 'no_rows_parsed' });
+    }
+
+    res.json({ rows, fallback: false });
+  } catch (err) {
+    console.error('PTSB parse error:', err.message);
+    // Password error
+    if (err.message?.toLowerCase().includes('password') || err.name === 'PasswordException') {
+      return res.status(400).json({ error: 'password_required', fallback: false });
+    }
+    res.json({ rows: [], fallback: true, reason: 'parse_error' });
+  }
+});
+
+function parseBankStatementText(text) {
+  const rows = [];
+  const lines = text.split('\n').map(l => l.trim()).filter(Boolean);
+
+  // Patterns for Irish bank statement dates
+  // PTSB CSV format: DD/MM/YYYY or DD MMM YYYY or YYYY-MM-DD
+  const datePatterns = [
+    /^(\d{2})\/(\d{2})\/(\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s*(?:([\d,]+\.\d{2})\s*)?([\d,]+\.\d{2})?\s*$/,
+    /^(\d{4}-\d{2}-\d{2})\s+(.+?)\s+([-]?[\d,]+\.\d{2})\s*$/,
+    /^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s*(?:([\d,]+\.\d{2})\s*)?([\d,]+\.\d{2})?\s*$/i,
+  ];
+
+  const MONTH_MAP = { jan:'01',feb:'02',mar:'03',apr:'04',may:'05',jun:'06',jul:'07',aug:'08',sep:'09',oct:'10',nov:'11',dec:'12' };
+
+  // Try to detect column positions from the text
+  // Look for lines that match transaction patterns
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+
+    // Pattern 1: DD/MM/YYYY Description Withdrawn PaidIn Balance
+    const m1 = line.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})?\s*([\d,]+\.\d{2})?\s*$/);
+    if (m1) {
+      const [, day, month, year, desc, col1, col2, col3] = m1;
+      const dateStr = `${year}-${month}-${day}`;
+      // col1 = withdrawn (debit), col2 = paid in (credit), col3 = balance
+      // If col2 and col3 exist, col1 is debit, col2 is credit
+      // If only col1 and col2 exist, could be either
+      const withdrawn = parseFloat(col1?.replace(/,/g,'')) || 0;
+      const paidIn = col2 ? parseFloat(col2.replace(/,/g,'')) : 0;
+
+      let amount;
+      if (col3) {
+        // 3-column format: Withdrawn | Paid In | Balance
+        // Only one of withdrawn/paidIn will be non-zero per transaction
+        if (paidIn > 0 && withdrawn === 0) {
+          amount = paidIn; // credit
+        } else if (withdrawn > 0) {
+          amount = -withdrawn; // debit
+        } else {
+          amount = 0;
+        }
+      } else if (col2) {
+        // 2-column format: Amount | Balance — col1 is the transaction amount (could be +/-)
+        amount = withdrawn; // keep sign as-is
+      } else {
+        // 1-column: debit only
+        amount = -withdrawn;
+      }
+
+      const cleanDesc = desc.replace(/\s+/g, ' ').trim();
+      if (cleanDesc.length > 1 && Math.abs(amount) > 0) {
+        rows.push({ date: dateStr, description: cleanDesc, amount: String(amount) });
+      }
+      continue;
+    }
+
+    // Pattern 2: YYYY-MM-DD Description Amount (Revolut-style)
+    const m2 = line.match(/^(\d{4}-\d{2}-\d{2})\s+(.+?)\s+([-]?[\d,]+\.\d{2})\s*$/);
+    if (m2) {
+      const [, date, desc, amtStr] = m2;
+      const amount = parseFloat(amtStr.replace(/,/g,''));
+      if (desc.length > 1 && !isNaN(amount)) {
+        rows.push({ date, description: desc.trim(), amount: String(amount) });
+      }
+      continue;
+    }
+
+    // Pattern 3: DD Mon YYYY Description Withdrawn PaidIn Balance
+    const m3 = line.match(/^(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s*([\d,]+\.\d{2})?\s*([\d,]+\.\d{2})?\s*$/i);
+    if (m3) {
+      const [, day, mon, year, desc, col1, col2, col3] = m3;
+      const monthNum = MONTH_MAP[mon.toLowerCase()];
+      const dateStr = `${year}-${monthNum}-${day.padStart(2,'0')}`;
+      const withdrawn = parseFloat(col1.replace(/,/g,'')) || 0;
+      const paidIn = col2 ? parseFloat(col2.replace(/,/g,'')) : 0;
+      let amount;
+      if (col3) {
+        amount = (paidIn > 0 && withdrawn === 0) ? paidIn : -withdrawn;
+      } else {
+        amount = -withdrawn;
+      }
+
+      const cleanDesc = desc.replace(/\s+/g, ' ').trim();
+      if (cleanDesc.length > 1 && Math.abs(amount) > 0) {
+        rows.push({ date: dateStr, description: cleanDesc, amount: String(amount) });
+      }
+      continue;
+    }
+
+    // Pattern 4: Multi-word lines — try to extract PTSB transaction type prefixes
+    // Lines like: "07 Jan 2025 TKN TESCO STORES 1406 2 68.40 1,234.56"
+    const m4 = line.match(/(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{2,4})\s+((?:TKN|VPP|POS|ICT|DD|CT|RTD|GBP|USD|T\/F)\s+.+?)\s+([\d,]+\.\d{2})\s*([\d,]+\.\d{2})?\s*([\d,]+\.\d{2})?\s*$/i);
+    if (m4) {
+      const [, day, mon, yearStr, desc, col1, col2, col3] = m4;
+      const year = yearStr.length === 2 ? '20' + yearStr : yearStr;
+      const monthNum = MONTH_MAP[mon.toLowerCase()];
+      const dateStr = `${year}-${monthNum}-${day.padStart(2,'0')}`;
+      const withdrawn = parseFloat(col1.replace(/,/g,'')) || 0;
+      const paidIn = col2 ? parseFloat(col2.replace(/,/g,'')) : 0;
+      const amount = col3
+        ? ((paidIn > 0 && withdrawn === 0) ? paidIn : -withdrawn)
+        : -withdrawn;
+
+      // Strip PTSB prefix
+      const cleanDesc = desc.replace(/^(TKN|VPP|POS|ICT|DD|CT|RTD|GBP|USD|T\/F)\s+/i, '').replace(/\s+/g, ' ').trim();
+      if (cleanDesc.length > 1 && Math.abs(amount) > 0) {
+        rows.push({ date: dateStr, description: cleanDesc, amount: String(amount) });
+      }
+    }
+  }
+
+  // Deduplicate (same date+desc+amount)
+  const seen = new Set();
+  return rows.filter(r => {
+    const key = `${r.date}|${r.description}|${r.amount}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
 
