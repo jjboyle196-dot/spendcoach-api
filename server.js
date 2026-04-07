@@ -2,6 +2,8 @@ const express = require('express');
 const cors = require('cors');
 let pdfParse = null;
 try { pdfParse = require('pdf-parse'); } catch(e) { console.warn('pdf-parse not available:', e.message); }
+let stripe = null;
+try { stripe = require('stripe')(process.env.STRIPE_SECRET_KEY); } catch(e) { console.warn('Stripe not available:', e.message); }
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -984,6 +986,88 @@ function parseBankStatementText(text) {
     return true;
   });
 }
+
+// ── STRIPE CHECKOUT ──
+app.post('/create-checkout-session', async (req, res) => {
+  if (!stripe) return res.status(500).json({ error: 'Stripe not configured.' });
+  const { userId, email } = req.body;
+  if (!userId) return res.status(400).json({ error: 'Missing userId.' });
+
+  try {
+    const session = await stripe.checkout.sessions.create({
+      payment_method_types: ['card'],
+      mode: 'subscription',
+      line_items: [{
+        price: process.env.STRIPE_PRICE_ID,
+        quantity: 1,
+      }],
+      customer_email: email || undefined,
+      client_reference_id: userId,
+      success_url: 'https://skint.ie/?checkout=success',
+      cancel_url: 'https://skint.ie/?checkout=cancelled',
+      allow_promotion_codes: true,
+    });
+    res.json({ url: session.url, sessionId: session.id });
+  } catch (err) {
+    console.error('Stripe checkout error:', err.message);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── STRIPE WEBHOOK (mark user as Pro after payment) ──
+app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  let event;
+  try {
+    event = webhookSecret
+      ? stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
+      : JSON.parse(req.body);
+  } catch (err) {
+    console.error('Webhook signature error:', err.message);
+    return res.status(400).json({ error: 'Webhook error.' });
+  }
+
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object;
+    const userId = session.client_reference_id;
+    const customerId = session.customer;
+    const subscriptionId = session.subscription;
+
+    if (userId && SUPABASE_KEY) {
+      try {
+        await supabaseRequest(`/user_data?user_id=eq.${userId}`, 'PATCH', {
+          stripe_customer_id: customerId,
+          stripe_subscription_id: subscriptionId,
+          is_pro: true,
+          updated_at: new Date().toISOString(),
+        });
+        console.log('User upgraded to Pro:', userId);
+      } catch(e) {
+        console.error('Failed to update Pro status:', e.message);
+      }
+    }
+  }
+
+  if (event.type === 'customer.subscription.deleted') {
+    const sub = event.data.object;
+    const customerId = sub.customer;
+    if (SUPABASE_KEY) {
+      try {
+        await supabaseRequest(`/user_data?stripe_customer_id=eq.${customerId}`, 'PATCH', {
+          is_pro: false,
+          updated_at: new Date().toISOString(),
+        });
+        console.log('User downgraded from Pro:', customerId);
+      } catch(e) {
+        console.error('Failed to update Pro status:', e.message);
+      }
+    }
+  }
+
+  res.json({ received: true });
+});
 
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
 
