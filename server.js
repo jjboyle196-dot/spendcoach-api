@@ -75,8 +75,25 @@ async function saveMerchantMappings(mappings) {
 getMerchantCache().catch(() => {});
 
 // ── CORS ──
+const ALLOWED_ORIGINS = [
+  'https://skint.ie',
+  'https://www.skint.ie',
+  'http://localhost:3000',
+  'http://localhost:8080',
+  /\.netlify\.app$/,
+];
+
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGIN || '*',
+  origin: (origin, callback) => {
+    // Allow requests with no origin (mobile apps, Postman, server-to-server)
+    if (!origin) return callback(null, true);
+    const allowed = ALLOWED_ORIGINS.some(o =>
+      typeof o === 'string' ? o === origin : o.test(origin)
+    );
+    if (allowed) return callback(null, true);
+    console.warn('Blocked CORS request from:', origin);
+    callback(new Error('Not allowed by CORS'));
+  },
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
 app.use(express.json({ limit: '20mb' }));
@@ -92,31 +109,143 @@ If month-on-month data is given, reference whether they improved or got worse.
 End with one concrete weekly challenge as a single sentence starting with "Challenge:".
 Keep the total response under 130 words. No bullet points. Conversational Irish tone — not preachy, not American.`;
 
-// ── RATE LIMITING (simple in-memory, resets on restart) ──
+// ── RATE LIMITING ──
 const requestCounts = new Map();
-const RATE_LIMIT = 10; // requests per IP per hour
-const RATE_WINDOW = 60 * 60 * 1000; // 1 hour in ms
 
-function rateLimit(req, res, next) {
-  const ip = req.headers['x-forwarded-for']?.split(',')[0] || req.ip;
+function getRateLimitKey(req) {
+  return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
+}
+
+function checkRateLimit(key, endpoint, limit, windowMs) {
   const now = Date.now();
-  const entry = requestCounts.get(ip);
+  const mapKey = `${key}:${endpoint}`;
+  const entry = requestCounts.get(mapKey);
 
-  if (!entry || now - entry.windowStart > RATE_WINDOW) {
-    requestCounts.set(ip, { count: 1, windowStart: now });
-    return next();
+  if (!entry || now - entry.windowStart > windowMs) {
+    requestCounts.set(mapKey, { count: 1, windowStart: now });
+    return { allowed: true, remaining: limit - 1 };
   }
 
-  if (entry.count >= RATE_LIMIT) {
-    return res.status(429).json({ error: 'Too many requests. Please try again later.' });
+  if (entry.count >= limit) {
+    const resetIn = Math.ceil((entry.windowStart + windowMs - now) / 1000 / 60);
+    return { allowed: false, resetIn };
   }
 
   entry.count++;
+  return { allowed: true, remaining: limit - entry.count };
+}
+
+// Clean up old entries every 30 mins to prevent memory leak
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of requestCounts.entries()) {
+    if (now - entry.windowStart > 24 * 60 * 60 * 1000) {
+      requestCounts.delete(key);
+    }
+  }
+}, 30 * 60 * 1000);
+
+// Different limits per endpoint type
+function rateLimitCoach(req, res, next) {
+  const key = getRateLimitKey(req);
+  // 5 coaching requests per hour per IP
+  const result = checkRateLimit(key, 'coach', 5, 60 * 60 * 1000);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: `Too many AI coaching requests. Try again in ${result.resetIn} minutes.`
+    });
+  }
   next();
 }
 
+function rateLimitVision(req, res, next) {
+  const key = getRateLimitKey(req);
+  // 3 vision parses per hour per IP — these are expensive
+  const result = checkRateLimit(key, 'vision', 3, 60 * 60 * 1000);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: `Too many PDF vision requests. Try again in ${result.resetIn} minutes.`
+    });
+  }
+  // Also check daily limit: 10 per day
+  const dailyResult = checkRateLimit(key, 'vision_daily', 10, 24 * 60 * 60 * 1000);
+  if (!dailyResult.allowed) {
+    return res.status(429).json({
+      error: 'Daily PDF parsing limit reached. Try again tomorrow.'
+    });
+  }
+  next();
+}
+
+function rateLimitParse(req, res, next) {
+  const key = getRateLimitKey(req);
+  // 20 text parses per hour — cheap, just text processing
+  const result = checkRateLimit(key, 'parse', 20, 60 * 60 * 1000);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: `Too many requests. Try again in ${result.resetIn} minutes.`
+    });
+  }
+  next();
+}
+
+function rateLimitCheckout(req, res, next) {
+  const key = getRateLimitKey(req);
+  // 5 checkout attempts per hour — prevent abuse
+  const result = checkRateLimit(key, 'checkout', 5, 60 * 60 * 1000);
+  if (!result.allowed) {
+    return res.status(429).json({
+      error: `Too many checkout attempts. Try again in ${result.resetIn} minutes.`
+    });
+  }
+  next();
+}
+
+// Keep old rateLimit function for backward compat
+function rateLimit(req, res, next) {
+  return rateLimitParse(req, res, next);
+}
+
+// ── COST GUARD — track estimated daily API spend ──
+let dailyCostTracker = { date: '', visionCalls: 0, coachCalls: 0, parseCalls: 0 };
+
+function trackCost(type) {
+  const today = new Date().toISOString().slice(0, 10);
+  if (dailyCostTracker.date !== today) {
+    dailyCostTracker = { date: today, visionCalls: 0, coachCalls: 0, parseCalls: 0 };
+  }
+  if (type === 'vision') dailyCostTracker.visionCalls++;
+  if (type === 'coach') dailyCostTracker.coachCalls++;
+  if (type === 'parse') dailyCostTracker.parseCalls++;
+
+  // Rough cost estimates: vision ~$0.20/call, coach ~$0.01, parse ~$0.01
+  const estimatedCost = (dailyCostTracker.visionCalls * 0.20) +
+                        (dailyCostTracker.coachCalls * 0.01) +
+                        (dailyCostTracker.parseCalls * 0.01);
+
+  if (estimatedCost > 5) {
+    console.warn(`⚠️ COST ALERT: Estimated daily API spend is $${estimatedCost.toFixed(2)} — vision: ${dailyCostTracker.visionCalls}, coach: ${dailyCostTracker.coachCalls}, parse: ${dailyCostTracker.parseCalls}`);
+  }
+
+  console.log(`API cost tracker — today: $${estimatedCost.toFixed(2)} | vision:${dailyCostTracker.visionCalls} coach:${dailyCostTracker.coachCalls} parse:${dailyCostTracker.parseCalls}`);
+}
+
 // ── HEALTH CHECK ──
-app.get('/health', (req, res) => res.json({ status: 'ok' }));
+app.get('/health', (req, res) => {
+  const estimatedCost = (dailyCostTracker.visionCalls * 0.20) +
+                        (dailyCostTracker.coachCalls * 0.01) +
+                        (dailyCostTracker.parseCalls * 0.01);
+  res.json({
+    status: 'ok',
+    today: dailyCostTracker.date,
+    estimatedDailyCost: `$${estimatedCost.toFixed(2)}`,
+    calls: {
+      vision: dailyCostTracker.visionCalls,
+      coach: dailyCostTracker.coachCalls,
+      parse: dailyCostTracker.parseCalls
+    }
+  });
+});
 
 // ── MERCHANT MAP ENDPOINTS ──
 app.get('/merchant-map', async (req, res) => {
@@ -154,11 +283,13 @@ TRANSACTION TYPE CODES (second token):
 "î&&" or "î &" = VPP (Visa card payment)
 "&!ë" = POS (contactless/card)
 "ñäè" = ICT (incoming credit transfer)
-"àà" = DD (direct debit)
+"àà" or "ä+ä" = DD (direct debit)
 "åâ&" = GBP (UK payment)
 "íëà" = USD (US payment)
 "êÈÀ" = RTD (return/refund)
 "äè" = CT (credit transfer)
+" è(" = ATM (cash withdrawal)
+"äè ëáè +è" = CT Settlement/Transmissions
 
 MERCHANT DECODING TABLE (match these patterns in the Details column):
 "èáëä! ëè!êáë" = Tesco Stores
@@ -519,6 +650,100 @@ MERCHANT DECODING TABLE (match these patterns in the Details column):
 "(äå!ï +ë" = McGowan's
 "ëäêñââ<áë" = Scramblers
 
+"<ëë ( êß ëèê" = LSS Mary Street
+"â!!ç!!ä!( í" = Bookhoocom (Booking.com)
+"ï ïç!ëèá<ï!ê<à" = WWW Hostelworld
+"ãêáá+!ïã" = Freshway F
+"ã< + å +ë êá" = Flannagans Restaurant
+"èçá ëè åë çá" = The Stags Head
+"èçá [ ê" = The Jar
+"èçêáá ñêá< +à" = Three Ireland
+"äá+èê      " = Centre
+"áíê!ë& ê ç +" = EuroSpar North
+"â!!ç!!ä!( í" = Booking.com
+"< & ä êà  &" = La Pacha (club)
+"ã< + å +ë êá" = Flannagans
+"ëè åë çá à" = Stags Head Dublin
+"&á++áßë ! ä!" = Penneys OC
+"èÇÁ â +.áêë" = The Bankers
+"à ßâêá .  ëè" = Daybreak Store
+"äá+èê  à (á" = Centre Dame St
+"äá+èê  ïáëè(!" = Centre Westmoreland
+"(ñà+ñåçè áìø" = Midnight Express
+"èáëä! ëè!êáë" = Tesco Stores
+"ë& ê ä!<<áåá" = Spar College
+"ë& ê ! ä!++á" = Spar OConnell
+"èÇÁ î/øÁ <ÑÃ" = The Vape Life
+"ïçá< +ë" = Wheels
+"(äà!+ <àë" = McDonalds
+"ß ( (!êñ ñ]" = Y By Mori
+"ß ( (!êñ ëíë" = Y By Mori Sus
+" è( àíâ ä!<<áåá å" = ATM Dublin College Green
+" è( àÍÂ%Ñ>" = ATM Dublin
+" è( àÍÂ<Ñ+" = ATM Dublin
+"àÍÂ<ÑÂ" = Dublin
+"&& !+<ñ+á" = PP Online
+"è!( ë ñ+èáê+á" = Toms Internet
+"<ñëâ!" = Lisbon
+"(ñëáêñä!êàñ" = Misericordia
+"<ÑËÂ?/" = Lisbon
+"â!<èáíä" = Boulteud (restaurant)
+" àíâ" = Adub
+"êß + ñê" = RYN IR
+"! åñ<ñ+ë" = O Gilins
+"è íà!  (!âñ<" = Teudo Mobile
+" áê!&!êè!" = Aeroporto
+"& í<  á êñä" = Pauls Eric
+"(ñëáêñä!êàñ  " = Misericordia
+" è( (ñëáêñä!êàñ" = ATM Misericordia
+" è( <ñëâ!" = ATM Lisbon
+"(íëè êà  ç (" = Mustard Ham
+"ë +è [!êàñ ç" = Sant Jordi H
+"è êèñ+á" = Tartine
+"(áí ëí&áê  ê" = MEU Super AR
+"&êñ( ê. <ñëâ!" = Primark Lisbon
+"(ñ+ñ(áêä à!" = Minimerced O
+" è( (ñëáêñä!êàñ" = ATM Misericordia
+" è( <ÑËÂ?" = ATM Lisbon
+"å%?Î? ( ê" = Glovo Mar
+"â ê à! êñ!" = Bar Daorio
+"ä!ããáá &!ñ+è" = Coffee Point
+"& êéíáë àá ë" = Parques de Si
+"ãí+à ä ! äí<" = Fund Co Cul
+"â ê à! êñ!" = Bar Daorio
+"&!ëè! àá îá+" = Posto de Ven
+"ä& <ñëâ!  ê!" = CP Lisboa RO
+"áààñá ê!ä.áè" = Eddie Rockets
+"èçá â< ä. âí" = The Black Bull
+"ä< ê.áë â ê" = Clarkes Bar
+"à!(ñ+ñäë è" = Dominics T
+"ãêáá+!ïâä<" = Freshway BCL
+"èçá äê!ëë" = The Cross
+"à!(ñ+ñäë &ñ]]" = Dominos Pizza
+"äï çÁ>ÊX ëÈ" = CW Henry St
+"ë& ê +!êèç ëñàá" = Spar Northside
+" è( åê ãè!+ëëâ(ñèç ëè" = ATM Grafton Smith St
+"î .áç!áë" = V Kehoes (pub)
+"ã?Ê_ÁÊ%ß" = Formerly
+"êáëñàá+è  àî" = Resident Adv
+"à (!+à &ñ]]" = Dd Mond Pizza
+" è( åê ãè!+ ëèêáá" = ATM Grafton Street
+"ñ+ë!(+ñ  àêí" = Insomnia Dru
+"èçá â ä. & å" = The Back Page
+"+ß ä?ÊÁÎÁ>À" = NY Corevent
+" è( <ÑËÂ?/" = ATM Lisbon
+"åê! ê.áë äá+>ß" = Groanrkes Denny
+" è( (ÑËÁÊÑä?ÊÀÑ" = ATM Misericordia
+" è( <ÑËÂ?" = ATM Lisbon
+"ä%/Ê,ÁË â/Ê" = Clarkes Bar
+"à?(Ñ>Ñä%Ë" = Dominicls
+"ã%ÑÅÇÈ ä%ÍÂ" = Flight Club
+"èÇÁ äÊ?ËË" = The Cross
+"â??ÈÇ?Ä?_ í" = Boohoocom (Boohoo)
+"ã%ÑÅÇÈ ä%Í" = Flight Club
+"ãñââáê ( åáá" = Fibber Magees
+"ëÄÊÑÂÂ%ÁÊ" = Scramblers
+
 For amounts: look for numeric values after the merchant name. Withdrawn column = negative amount, Paid In column = positive.
 For dates: combine month prefix + day number visible on the line. Use year from statement header.
 
@@ -642,7 +867,7 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
 });
 
 // ── COACH ENDPOINT ──
-app.post('/coach', rateLimit, async (req, res) => {
+app.post('/coach', rateLimitCoach, async (req, res) => {
   const { message } = req.body;
 
   if (!message || typeof message !== 'string') {
@@ -683,6 +908,7 @@ app.post('/coach', rateLimit, async (req, res) => {
     const data = await response.json();
     const text = data.content?.[0]?.text || '';
 
+    trackCost('coach');
     res.json({ text });
   } catch (err) {
     console.error('Coach error:', err.message);
@@ -695,44 +921,57 @@ const PDF_VISION_PROMPT = `You are a bank statement parser specialising in Irish
 Your job is to find every transaction visible in the images and return them as a JSON array.
 
 The statement columns are: Date | Details | Withdrawn | Paid In | Balance
-The Details column has a type prefix then merchant name. Strip the prefix, use only the merchant name.
-Prefixes: TKN, VPP, POS, ICT, DD, CT, RTD, GBP, USD
+
+CRITICAL DATE FORMAT: PTSB uses DDMMMYY format e.g. "06APR22" = 2022-04-06, "15JAN25" = 2025-01-15.
+Always convert to YYYY-MM-DD format.
+
+The Details column has a type prefix then merchant name. Strip the prefix entirely, use only the clean merchant name.
+Prefixes to strip: TKN, VPP, POS, ICT, DD, CT, RTD, GBP, USD, CNC, ATM, T/F
+
+AMOUNT RULES:
+- If amount is in the Withdrawn column → negative number
+- If amount is in the Paid In column → positive number  
+- The Balance column shows running balance — do NOT use this as the transaction amount
+- Balance shown as "193.23 -" means overdraft/debit balance — ignore the sign on balance
 
 Examples of how to read each line:
-- "TKN TESCO STORES 1406 2" → description: "Tesco Stores", category: "Groceries"
-- "TKN CIRCLE K 1406 2" → description: "Circle K", category: "Petrol & parking"
-- "VPP REVO REVOLUT*4059" → description: "Revolut", category: "Transfers"
-- "POS PADDY POWER" → description: "Paddy Power", category: "Pubs & bars"
-- "DD BORD GAIS EIREANN" → description: "Bord Gais", category: "Rent & bills"
-- "ICT JOHN BOYLE" → description: "Salary", category: "Income"
-- "POS DELIVEROO" → description: "Deliveroo", category: "Food delivery"
-- "TKN LIDL IRELAND" → description: "Lidl", category: "Groceries"
-- "TKN STARBUCKS" → description: "Starbucks", category: "Coffee"
-- "TKN McDONALDS" → description: "McDonald's", category: "Takeaways"
-- "DD VIRGIN MEDIA" → description: "Virgin Media", category: "Rent & bills"
-- "POS UBER" → description: "Uber", category: "Taxis"
-- "TKN NETFLIX" → description: "Netflix", category: "Subscriptions"
-- "POS BOOTS" → description: "Boots", category: "Health"
-- "TKN JUST EAT" → description: "Just Eat", category: "Food delivery"
+- "06APR22 | CNC INSOMNIA DRU | 6.90 | | 193.23-" → date:"2022-04-06", description:"Insomnia", amount:-6.90, category:"Coffee"
+- "06APR22 | TKN THE BACK PAGE | 7.50 | | 200.73-" → date:"2022-04-06", description:"The Back Page", amount:-7.50, category:"Pubs & bars"
+- "TKN TESCO STORES" → description:"Tesco Stores", category:"Groceries"
+- "TKN CIRCLE K" → description:"Circle K", category:"Petrol & parking"
+- "VPP REVOLUT" → description:"Revolut", category:"Transfers"
+- "DD BORD GAIS EIREANN" → description:"Bord Gais", category:"Rent & bills"
+- "ICT JOHN BOYLE" → description:"Salary", category:"Income"
+- "DD LIDL IRELAND" → description:"Lidl", category:"Groceries"
+- "TKN STARBUCKS" → description:"Starbucks", category:"Coffee"
+- "CNC MCDONALDS" → description:"McDonald's", category:"Takeaways"
+- "DD VIRGIN MEDIA" → description:"Virgin Media", category:"Rent & bills"
+- "POS UBER" → description:"Uber", category:"Taxis"
+- "TKN NETFLIX" → description:"Netflix", category:"Subscriptions"
+- "POS JUST EAT" → description:"Just Eat", category:"Food delivery"
+- "POS DELIVEROO" → description:"Deliveroo", category:"Food delivery"
+- "ATM WITHDRAWAL" → description:"ATM Withdrawal", category:"Cash withdrawal"
 
 Categories to use: Groceries, Food delivery, Takeaways, Pubs & bars, Coffee, Eating out, Taxis, Public transport, Petrol & parking, Travel, Subscriptions, Gaming, Clothing, Health, Fitness, Shopping, Rent & bills, Cash withdrawal, Transfers, Income, Other
 
 Each transaction object must have exactly these fields:
 - date: string in YYYY-MM-DD format
-- description: string — clean merchant name, no prefix, no location codes
+- description: string — clean merchant name, no prefix, no location codes, no card numbers
 - amount: number — negative for Withdrawn, positive for Paid In
 - category: string — one from the categories list above
 
 Return ONLY a valid JSON array, no other text, no markdown, no explanation.
+Skip non-transaction rows like "Balance B/fwd", "Balance Bfwd", "Closing Balance", "Overdraft Information".
 If you cannot find any transactions, return an empty array [].
 
 Example output:
 [
-  {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40,"category":"Groceries"},
+  {"date":"2022-04-06","description":"Insomnia","amount":-6.90,"category":"Coffee"},
+  {"date":"2022-04-06","description":"The Back Page","amount":-7.50,"category":"Pubs & bars"},
   {"date":"2025-03-31","description":"Salary","amount":2800.00,"category":"Income"}
 ]`;
 
-app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
+app.post('/parse-pdf-vision', rateLimitVision, async (req, res) => {
   req.setTimeout(120000); // 2 min timeout for vision requests
   res.setTimeout(120000);
   const { images } = req.body;
@@ -743,6 +982,13 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 
   if (images.length > 6) {
     return res.status(400).json({ error: 'Too many pages — maximum 6.' });
+  }
+
+  // Validate each image is a string and not too large
+  for (const img of images) {
+    if (typeof img !== 'string' || img.length > 3000000) {
+      return res.status(400).json({ error: 'Invalid or oversized image data.' });
+    }
   }
 
   const apiKey = process.env.ANTHROPIC_API_KEY;
@@ -784,6 +1030,7 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
     const raw = data.content?.[0]?.text || '[]';
     console.log('Vision images sent:', images.length, 'pages');
     console.log('Vision raw response length:', raw.length, 'first 200:', raw.slice(0, 200));
+    trackCost('vision');
 
     let rows = [];
     try {
@@ -812,7 +1059,7 @@ app.post('/parse-pdf-vision', rateLimit, async (req, res) => {
 });
 
 // ── PTSB PDF PARSER (no AI needed) ──
-app.post('/parse-ptsb', async (req, res) => {
+app.post('/parse-ptsb', rateLimitParse, async (req, res) => {
   req.setTimeout(30000);
   const { pdf: pdfBase64, password } = req.body;
 
@@ -834,7 +1081,8 @@ app.post('/parse-ptsb', async (req, res) => {
     // PTSB text PDFs have readable text with dates and amounts
     const hasDates = /\d{2}[\/-]\d{2}[\/-]\d{2,4}/.test(text) ||
                      /\d{4}-\d{2}-\d{2}/.test(text) ||
-                     /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i.test(text);
+                     /(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2}/i.test(text) ||
+                     /\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)\d{2}/i.test(text);
     const hasAmounts = /[\d,]+\.\d{2}/.test(text);
     const isGarbled = text.length > 100 &&
       (text.match(/[ÄÅÁÌÍÎÏÑÒÓÔÕÖáâãäåæçèéêëìíîïðñòóôõö]/g) || []).length > 15;
@@ -884,6 +1132,25 @@ function parseBankStatementText(text) {
   // Look for lines that match transaction patterns
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i];
+
+    // Pattern 5: DDMMMYY format (PTSB specific) e.g. "06APR22 CNC INSOMNIA 6.90 193.23"
+    const m5 = line.match(/^(\d{2})(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)(\d{2})\s+(.+?)\s+([\d,]+\.\d{2})\s*([\d,]+\.\d{2})?\s*([\d,]+\.\d{2}[\s-]*)?\s*$/i);
+    if (m5) {
+      const [, day, mon, yr, desc, col1, col2, col3] = m5;
+      const year = parseInt(yr) < 50 ? '20' + yr : '19' + yr;
+      const monthNum = MONTH_MAP[mon.toLowerCase()];
+      const dateStr = `${year}-${monthNum}-${day.padStart(2,'0')}`;
+      const withdrawn = parseFloat(col1?.replace(/,/g,'')) || 0;
+      const paidIn = col2 ? parseFloat(col2.replace(/,/g,'')) : 0;
+      const amount = col3
+        ? ((paidIn > 0 && withdrawn === 0) ? paidIn : -withdrawn)
+        : -withdrawn;
+      const cleanDesc = desc.replace(/^(TKN|VPP|POS|ICT|DD|CT|RTD|GBP|USD|CNC|ATM|T\/F)\s+/i, '').replace(/\s+/g, ' ').trim();
+      if (cleanDesc.length > 1 && Math.abs(amount) > 0) {
+        rows.push({ date: dateStr, description: cleanDesc, amount: String(amount) });
+      }
+      continue;
+    }
 
     // Pattern 1: DD/MM/YYYY Description Withdrawn PaidIn Balance
     const m1 = line.match(/^(\d{2})\/(\d{2})\/(\d{4})\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})?\s*([\d,]+\.\d{2})?\s*$/);
@@ -988,7 +1255,7 @@ function parseBankStatementText(text) {
 }
 
 // ── STRIPE CHECKOUT ──
-app.post('/create-checkout-session', async (req, res) => {
+app.post('/create-checkout-session', rateLimitCheckout, async (req, res) => {
   if (!stripe) return res.status(500).json({ error: 'Stripe not configured.' });
   const { userId, email } = req.body;
   if (!userId) return res.status(400).json({ error: 'Missing userId.' });
