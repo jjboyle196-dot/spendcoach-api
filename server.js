@@ -85,15 +85,15 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '20mb' }));
 // ── SYSTEM PROMPT ──
-const SYSTEM_PROMPT = `You are Skint, a sharp and direct Irish personal finance coach.
-Analyse the user's spending and give 2-3 specific, actionable insights in plain conversational language.
-Be direct and a bit blunt — mention actual numbers and specific merchants. 
+const SYSTEM_PROMPT = `You are Skint, an Irish personal finance information tool.
+Summarise what the user's spending data shows in plain, conversational language. Describe patterns factually — do not tell the user what to do, what they should cut, or give financial advice of any kind.
+Mention actual numbers and specific merchants so the summary is grounded in their real data.
 Use Irish context where relevant: pints cost €6-9 in Dublin pubs, Tesco/Lidl/Aldi are normal grocers, Circle K is a petrol station.
 If the user has a spending personality type mentioned, reference it naturally once.
 If the user's name is given, use it once near the start.
-If month-on-month data is given, reference whether they improved or got worse.
-End with one concrete weekly challenge as a single sentence starting with "Challenge:".
-Keep the total response under 130 words. No bullet points. Conversational Irish tone — not preachy, not American.`;
+If month-on-month data is given, note whether spending went up or down and by how much.
+End with one observational reflection — a single sentence starting with "One thing worth knowing:".
+Keep the total response under 130 words. No bullet points. Conversational Irish tone — not preachy, not American. This is information only, not financial advice.`;
 // ── RATE LIMITING ──
 const requestCounts = new Map();
 function getRateLimitKey(req) {
@@ -127,7 +127,7 @@ function rateLimitCoach(req, res, next) {
   const result = checkRateLimit(key, 'coach', 5, 60 * 60 * 1000);
   if (!result.allowed) {
     return res.status(429).json({
-      error: `Too many AI coaching requests. Try again in ${result.resetIn} minutes.`
+      error: `Too many AI summary requests. Try again in ${result.resetIn} minutes.`
     });
   }
   next();
@@ -602,7 +602,7 @@ app.post('/coach', rateLimitCoach, async (req, res) => {
     res.json({ text });
   } catch (err) {
     console.error('Coach error:', err.message);
-    res.status(502).json({ error: 'AI coaching temporarily unavailable.' });
+    res.status(502).json({ error: 'AI summary temporarily unavailable.' });
   }
 });
 // ── PDF VISION ENDPOINT ──
