@@ -97,6 +97,9 @@ Keep the total response under 130 words. No bullet points. Conversational Irish 
 // ── RATE LIMITING ──
 const requestCounts = new Map();
 function getRateLimitKey(req) {
+  // Authenticated users — rate-limit by user ID (more accurate than IP, especially for users behind shared NAT)
+  if (req.user && req.user.id) return 'u:' + req.user.id;
+  // Anonymous — rate-limit by IP
   return req.headers['x-forwarded-for']?.split(',')[0]?.trim() || req.ip || 'unknown';
 }
 function checkRateLimit(key, endpoint, limit, windowMs) {
@@ -134,18 +137,20 @@ function rateLimitCoach(req, res, next) {
 }
 function rateLimitVision(req, res, next) {
   const key = getRateLimitKey(req);
-  // 15 vision calls per hour per IP (raised from 3 — batches of 6 pages per call)
-  const result = checkRateLimit(key, 'vision', 15, 60 * 60 * 1000);
+  // Authed users: 15/hr, anon: 5/hr
+  const hourlyLimit = (req.user && req.user.id) ? 15 : 5;
+  const result = checkRateLimit(key, 'vision', hourlyLimit, 60 * 60 * 1000);
   if (!result.allowed) {
     return res.status(429).json({
       error: `Too many PDF vision requests. Try again in ${result.resetIn} minutes.`
     });
   }
-  // Also check daily limit: 10 per day
-  const dailyResult = checkRateLimit(key, 'vision_daily', 10, 24 * 60 * 60 * 1000);
+  // Daily: 10 authed, 3 anon
+  const dailyLimit = (req.user && req.user.id) ? 10 : 3;
+  const dailyResult = checkRateLimit(key, 'vision_daily', dailyLimit, 24 * 60 * 60 * 1000);
   if (!dailyResult.allowed) {
     return res.status(429).json({
-      error: 'Daily PDF parsing limit reached. Try again tomorrow.'
+      error: 'Daily PDF parsing limit reached. Try again tomorrow, or sign in for higher limits.'
     });
   }
   next();
@@ -173,6 +178,77 @@ function rateLimitCheckout(req, res, next) {
 function rateLimit(req, res, next) {
   return rateLimitParse(req, res, next);
 }
+
+// ── AUTH: Verify Supabase JWT ──
+// Verifies the Authorization: Bearer <token> header against Supabase.
+// On success: req.user = { id, email }
+// On failure: 401 Unauthorized
+async function requireAuth(req, res, next) {
+  // In dev, allow ?dev=1 query OR an absent token (so curl tests still work locally if SUPABASE_JWT_SECRET unset)
+  const SUPABASE_JWT_SECRET = process.env.SUPABASE_JWT_SECRET;
+  if (!SUPABASE_JWT_SECRET) {
+    // Misconfigured: refuse rather than silently allow in production
+    if (process.env.NODE_ENV === 'production') {
+      return res.status(500).json({ error: 'Server auth not configured.' });
+    }
+    // Dev: allow through but tag user as anonymous
+    req.user = { id: 'dev-anonymous', email: null };
+    return next();
+  }
+
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
+  if (!token) {
+    return res.status(401).json({ error: 'Authorization required. Please sign in.' });
+  }
+
+  // Verify against Supabase by hitting their /auth/v1/user endpoint with the token.
+  // Simpler than pulling in a JWT lib — Supabase does the validation.
+  try {
+    const verifyRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'apikey': SUPABASE_KEY || ''
+      }
+    });
+    if (!verifyRes.ok) {
+      return res.status(401).json({ error: 'Invalid or expired session. Please sign in again.' });
+    }
+    const userData = await verifyRes.json();
+    if (!userData || !userData.id) {
+      return res.status(401).json({ error: 'Invalid session.' });
+    }
+    req.user = { id: userData.id, email: userData.email };
+    next();
+  } catch (e) {
+    console.error('Auth verification failed:', e.message);
+    return res.status(503).json({ error: 'Auth service temporarily unavailable.' });
+  }
+}
+
+// ── AUTH (soft): like requireAuth but doesn't reject anonymous users.
+// Sets req.user to null if no token. Useful for endpoints we want to
+// rate-limit per-user when authed but still allow anon usage.
+async function softAuth(req, res, next) {
+  const authHeader = req.headers.authorization || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+  if (!token) { req.user = null; return next(); }
+  try {
+    const verifyRes = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}`, 'apikey': SUPABASE_KEY || '' }
+    });
+    if (!verifyRes.ok) { req.user = null; return next(); }
+    const data = await verifyRes.json();
+    req.user = data && data.id ? { id: data.id, email: data.email } : null;
+  } catch (e) {
+    req.user = null;
+  }
+  next();
+}
+
 // ── COST GUARD ──
 let dailyCostTracker = { date: '', visionCalls: 0, coachCalls: 0, parseCalls: 0 };
 function trackCost(type) {
@@ -783,7 +859,7 @@ Example output:
   {"date":"2025-03-07","description":"Tesco Stores","amount":-68.40},
   {"date":"2025-03-31","description":"Salary","amount":2800.00}
 ]`;
-app.post('/parse-pdf', rateLimit, async (req, res) => {
+app.post('/parse-pdf', softAuth, rateLimit, async (req, res) => {
   const { text, rawLines } = req.body;
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'Missing text field.' });
@@ -865,7 +941,7 @@ app.post('/parse-pdf', rateLimit, async (req, res) => {
   }
 });
 // ── COACH ENDPOINT ──
-app.post('/coach', rateLimitCoach, async (req, res) => {
+app.post('/coach', requireAuth, rateLimitCoach, async (req, res) => {
   const { message } = req.body;
   if (!message || typeof message !== 'string') {
     return res.status(400).json({ error: 'Missing message field.' });
@@ -1372,7 +1448,7 @@ Other merchants:
 Return ONLY a valid JSON array, no other text, no markdown, no explanation.
 Skip non-transaction rows like "Balance B/fwd", "Balance Bfwd", "Closing Balance", "Overdraft Information".
 If you cannot find any transactions, return an empty array [].`;
-app.post('/parse-pdf-vision', rateLimitVision, async (req, res) => {
+app.post('/parse-pdf-vision', softAuth, rateLimitVision, async (req, res) => {
   req.setTimeout(120000);
   res.setTimeout(120000);
   const { images } = req.body;
@@ -1448,7 +1524,7 @@ app.post('/parse-pdf-vision', rateLimitVision, async (req, res) => {
   }
 });
 // ── PTSB PDF PARSER ──
-app.post('/parse-ptsb', rateLimitParse, async (req, res) => {
+app.post('/parse-ptsb', softAuth, rateLimitParse, async (req, res) => {
   req.setTimeout(30000);
   const { pdf: pdfBase64, password } = req.body;
   if (!pdfBase64) {
@@ -1585,10 +1661,11 @@ function parseBankStatementText(text) {
   });
 }
 // ── STRIPE CHECKOUT ──
-app.post('/create-checkout-session', rateLimitCheckout, async (req, res) => {
+app.post('/create-checkout-session', requireAuth, rateLimitCheckout, async (req, res) => {
   if (!stripe) return res.status(500).json({ error: 'Stripe not configured.' });
-  const { userId, email } = req.body;
-  if (!userId) return res.status(400).json({ error: 'Missing userId.' });
+  // Authenticated user — never trust client-supplied userId
+  const userId = req.user.id;
+  const email = req.user.email || req.body.email;
   try {
     const session = await stripe.checkout.sessions.create({
       payment_method_types: ['card'],
@@ -1660,7 +1737,10 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
 });
 app.listen(PORT, () => console.log(`Skint API running on port ${PORT}`));
 // ── CATEGORISE ENDPOINT ──
-app.post('/categorise', rateLimit, async (req, res) => {
+// Keep-alive ping — warms server on page load
+app.get('/ping', (req, res) => res.json({ ok: true }));
+
+app.post('/categorise', softAuth, rateLimit, async (req, res) => {
   const { merchants } = req.body;
   if (!merchants || !Array.isArray(merchants) || merchants.length === 0) {
     return res.status(400).json({ error: 'Missing merchants array.' });
