@@ -1807,3 +1807,4 @@ ${merchants.map((m, i) => `${i + 1}. ${m}`).join('\n')}`;
     res.status(502).json({ error: 'Categorisation temporarily unavailable.' });
   }
 });
+Add JWT auth + Tax Back rent credit detection
