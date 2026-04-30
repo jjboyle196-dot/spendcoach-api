@@ -63,6 +63,150 @@ async function saveMerchantMappings(mappings) {
   }
 }
 getMerchantCache().catch(() => {});
+
+// ═══════════════════════════════════════════════════════════════
+// MERCHANT LIBRARY (Phase 2 — wired into categoriser)
+// ═══════════════════════════════════════════════════════════════
+// The library has 3 tables in Supabase:
+//   merchants          — canonical (e.g. "Tesco" → "Groceries")
+//   merchant_aliases   — raw bank strings → merchant_id mapping
+//   merchant_corrections — anonymous user category corrections
+//
+// Pipeline at categorise time:
+//   1. Normalize the raw merchant string
+//   2. Look up alias in merchant_aliases
+//   3. If found, return the canonical merchant + category instantly
+//   4. If not, hand off to AI categorisation
+//   5. After AI returns, save the result back to the library for next time
+
+let merchantLibCache = {}; // { normalized_alias: { canonical_name, category } }
+let merchantLibLoaded = 0;
+
+// Normalize a raw bank merchant string. MUST match the SQL function semantics:
+// lowercase, strip 4+ digit numbers, strip location words, strip punctuation, collapse whitespace.
+function normalizeMerchantString(raw) {
+  if (!raw || typeof raw !== 'string') return '';
+  return raw
+    .toLowerCase()
+    // Replace separators (dots, slashes, hyphens, asterisks, plus) with spaces
+    .replace(/[.\/\\\-_*+|]/g, ' ')
+    // Strip 4+ digit numbers (card numbers, store IDs)
+    .replace(/\d{4,}/g, '')
+    // Strip location/filler words
+    .replace(/\b(st|street|rd|road|ave|avenue|dublin|cork|galway|limerick|ireland|ie|co|com|bill|app|the|ltd)\b/gi, '')
+    // Remove remaining non-alphanumeric (keep spaces)
+    .replace(/[^a-z0-9 ]/g, '')
+    // Collapse whitespace
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function loadMerchantLibrary() {
+  const now = Date.now();
+  // Cache for 10 minutes
+  if (now - merchantLibLoaded < 10 * 60 * 1000 && Object.keys(merchantLibCache).length > 0) {
+    return merchantLibCache;
+  }
+  if (!SUPABASE_KEY) return merchantLibCache;
+  try {
+    // Pull all aliases joined with their merchant for fast lookup
+    // Note: PostgREST embedded resource syntax
+    const aliases = await supabaseRequest('/merchant_aliases?select=raw_string,merchants(canonical_name,category)&limit=5000');
+    if (aliases && Array.isArray(aliases)) {
+      const newCache = {};
+      for (const a of aliases) {
+        if (a.raw_string && a.merchants) {
+          newCache[a.raw_string] = {
+            canonical_name: a.merchants.canonical_name,
+            category: a.merchants.category,
+          };
+        }
+      }
+      merchantLibCache = newCache;
+      merchantLibLoaded = now;
+      console.log(`[merchant-lib] loaded ${aliases.length} aliases`);
+    }
+  } catch (e) {
+    console.error('[merchant-lib] failed to load:', e.message);
+  }
+  return merchantLibCache;
+}
+
+// Try to look up a merchant string in the library. Returns null if not found.
+function lookupMerchant(rawString) {
+  const normalized = normalizeMerchantString(rawString);
+  if (!normalized) return null;
+  // Exact match first
+  if (merchantLibCache[normalized]) return merchantLibCache[normalized];
+  // Try a few prefix-based fallbacks for noisy strings:
+  // "tesco stores" matches "tesco" if we have it canonically
+  for (const key of Object.keys(merchantLibCache)) {
+    if (normalized.startsWith(key + ' ') || key.startsWith(normalized + ' ')) {
+      return merchantLibCache[key];
+    }
+  }
+  return null;
+}
+
+// Save new merchant + alias to the library after AI categorisation.
+// Pipeline: ensure canonical merchant exists, then add alias mapping.
+async function saveMerchantToLibrary(rawString, category) {
+  if (!SUPABASE_KEY || !rawString || !category) return;
+  const normalized = normalizeMerchantString(rawString);
+  if (!normalized || normalized.length < 2) return;
+
+  try {
+    // Use the normalized string as canonical_name. Could be smarter
+    // (e.g. "Tesco Stores 3094" → "Tesco") but this is a safe v1.
+    // We use upsert via "Prefer: resolution=merge-duplicates" header.
+    // First, ensure canonical merchant exists. If category conflicts, the latest write wins.
+    const merchant = await supabaseRequest('/merchants', 'POST', [{
+      canonical_name: normalized,
+      category: category,
+      source: 'ai_single',
+      confidence: 0.6,
+      seen_count: 1,
+    }]);
+    // Now look up the merchant_id for this canonical_name
+    const lookup = await supabaseRequest(`/merchants?canonical_name=eq.${encodeURIComponent(normalized)}&select=id&limit=1`);
+    if (!lookup || !Array.isArray(lookup) || lookup.length === 0) return;
+    const merchantId = lookup[0].id;
+
+    // Save the alias mapping
+    await supabaseRequest('/merchant_aliases', 'POST', [{
+      merchant_id: merchantId,
+      raw_string: normalized,
+      source: 'ai_single',
+      confidence: 0.6,
+      seen_count: 1,
+    }]);
+
+    // Update local cache so next request hits it
+    merchantLibCache[normalized] = { canonical_name: normalized, category };
+  } catch (e) {
+    console.error('[merchant-lib] save failed for', rawString, ':', e.message);
+  }
+}
+
+// Save a user correction (when user re-categorises a transaction in the UI).
+// This goes to merchant_corrections so we can detect community trends.
+async function saveCorrection(rawString, suggestedCategory, correctedCategory) {
+  if (!SUPABASE_KEY || !rawString || !correctedCategory) return;
+  const normalized = normalizeMerchantString(rawString);
+  if (!normalized) return;
+  try {
+    await supabaseRequest('/merchant_corrections', 'POST', [{
+      alias_raw: normalized,
+      suggested_category: suggestedCategory || null,
+      corrected_category: correctedCategory,
+    }]);
+  } catch (e) {
+    console.error('[merchant-lib] correction save failed:', e.message);
+  }
+}
+
+// Load library on startup, refresh every 10 mins
+loadMerchantLibrary().catch(() => {});
 // ── CORS ──
 const ALLOWED_ORIGINS = [
   'https://skint.ie',
@@ -303,6 +447,670 @@ app.post('/merchant-map', async (req, res) => {
   await saveMerchantMappings(clean);
   res.json({ saved: clean.length });
 });
+// ═══════════════════════════════════════════════════════════════
+// BANK FORMAT DETECTION + STRUCTURAL PARSERS
+// ═══════════════════════════════════════════════════════════════
+// Bank-specific hint passed to the AI prompt as additional context.
+// Used as fallback when the structural parser fails.
+function getBankHint(bank) {
+  switch (bank) {
+    case 'aib':
+      return `AIB statements use DD/MM/YYYY format. Columns: Date | Description | Debit | Credit | Balance.
+Negative amounts go in "Debit", positive in "Credit". Direct debits often start with "DD". `;
+    case 'boi':
+      return `Bank of Ireland statements use DD/MM/YYYY format. Columns: Date | Description | Debit | Credit | Balance.
+Watch for "POS" (point of sale), "ATM", "DD" (direct debit) prefixes in description. `;
+    case 'n26':
+      return `N26 statements use DD/MM/YYYY format. Outgoings shown as negative euro amounts.
+Common patterns: "MasterCard Payment", "Direct Debit", "Income". `;
+    case 'ptsb':
+      return `PTSB / Permanent TSB statements use DD/MM/YYYY format. The text encoding is custom — use the decoding tables above. `;
+    default:
+      return '';
+  }
+}
+
+// Detect which bank this PDF text is from. Returns one of:
+//   'revolut' | 'aib' | 'boi' | 'ptsb' | 'n26' | 'unknown'
+// Detection runs on the first ~3000 chars to keep it fast.
+function detectBank(text) {
+  if (!text || typeof text !== 'string') return 'unknown';
+  const sample = text.slice(0, 3000).toLowerCase();
+  // Order matters — most distinctive markers first
+  if (sample.includes('revolut bank uab') || sample.includes('revoie23') || sample.includes('revolut.com')) return 'revolut';
+  if (sample.includes('permanent tsb') || sample.includes('ptsb.ie') || /\b(\[\s*\+|ãáâ|\(\s*ê)\b/.test(text.slice(0, 5000))) return 'ptsb';
+  if (sample.includes('allied irish bank') || sample.includes('aib.ie') || /\baib\b/.test(sample)) return 'aib';
+  if (sample.includes('bank of ireland') || sample.includes('bankofireland.com') || sample.includes('bofi')) return 'boi';
+  if (sample.includes('n26 bank') || sample.includes('n26.com') || /\bn26\b/.test(sample)) return 'n26';
+  return 'unknown';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// REVOLUT PARSER — clean, structural, no AI needed
+// ═══════════════════════════════════════════════════════════════
+// Revolut PDFs are well-structured:
+//   - Each transaction starts with a date in "D MMM YYYY" format
+//   - Description on the same line
+//   - "Money out" or "Money in" column with €amount
+//   - Optional "To:" / "From:" / "Reference:" / "Card:" continuation lines
+//   - "To pocket" / "Pocket Withdrawal" = internal transfers (skip from totals)
+//   - "Personal and Group Pockets transactions" section = duplicates of internal moves (skip ENTIRELY)
+//
+// Returns array of: { date, description, amount, direction, isInternal, balance }
+// Where amount is always positive; direction is 'out' or 'in'.
+function parseRevolut(text) {
+  if (!text) return [];
+  const lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const results = [];
+
+  // Determine where the main "Account transactions" section starts.
+  // Anything BEFORE this header is either header noise OR the "Pending" section
+  // (which we want to skip — those transactions will appear in main once settled).
+  let mainStart = 0;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^Account transactions from/i.test(lines[i])) {
+      mainStart = i + 1;
+      break;
+    }
+  }
+
+  // Skip the entire "Personal and Group Pockets transactions" section.
+  // It's a duplicate breakdown of internal pocket movements — would cause double counting.
+  let mainEnd = lines.length;
+  for (let i = mainStart; i < lines.length; i++) {
+    if (/^Personal and Group Pockets transactions/i.test(lines[i])) {
+      mainEnd = i;
+      break;
+    }
+  }
+  const workingLines = lines.slice(mainStart, mainEnd);
+
+  // Match date-prefixed transaction lines: "1 Feb 2026", "29 Apr 2026", etc.
+  const dateRegex = /^(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(.+)/;
+  const monthMap = { jan:0, feb:1, mar:2, apr:3, may:4, jun:5, jul:6, aug:7, sep:8, oct:9, nov:10, dec:11 };
+
+  // Pattern to extract amounts from a line. Revolut format: €X.XX or €X,XXX.XX
+  const amountRegex = /€([\d,]+\.\d{2})/g;
+
+  for (let i = 0; i < workingLines.length; i++) {
+    const line = workingLines[i];
+    const dateMatch = line.match(dateRegex);
+    if (!dateMatch) continue;
+
+    const [, day, monStr, year, rest] = dateMatch;
+    const monIdx = monthMap[monStr.toLowerCase()];
+    if (monIdx === undefined) continue;
+    const dateISO = `${year}-${String(monIdx + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+
+    // Extract amounts on this line. Last one is balance, prior ones are money out/in.
+    const amtMatches = [...rest.matchAll(amountRegex)].map(m => parseFloat(m[1].replace(/,/g, '')));
+
+    // Description = everything before the first €
+    const firstEurIdx = rest.search(/€/);
+    let description = (firstEurIdx >= 0 ? rest.slice(0, firstEurIdx) : rest).trim();
+
+    if (amtMatches.length === 0) continue;
+
+    // Look ahead for continuation lines (To: / From: / Reference: / Card:)
+    let extraDetail = '';
+    let counterpartyIs = ''; // 'To:' or 'From:'
+    let j = i + 1;
+    while (j < workingLines.length) {
+      const next = workingLines[j];
+      if (dateRegex.test(next)) break; // next transaction
+      if (/^(To|From|Reference|Card|Fee|Revolut Rate):/i.test(next)) {
+        const dirMatch = next.match(/^(To|From):\s*(.+)/i);
+        if (dirMatch) {
+          if (!counterpartyIs) counterpartyIs = dirMatch[1];
+          extraDetail += ' ' + dirMatch[2].split(',')[0]; // first part of "To: Tesco Stores 3584, Dublin 9" = "Tesco Stores 3584"
+        }
+        j++;
+        continue;
+      }
+      // Some Revolut continuation lines don't have a label (e.g. just "From: NAME, IBAN")
+      // Stop when we hit something that looks like a new transaction or section header
+      break;
+    }
+
+    // Determine direction.
+    // Revolut layout: Money out | Money in | Balance — but column extraction may shuffle order.
+    // Heuristic:
+    //   - If 2 amounts: amounts are [money_out_or_in, balance] OR [money, balance]
+    //   - If 3 amounts: rare, typically a fee line — take the first as primary amount
+    // We use the description and counterparty hint to determine direction.
+
+    let amount, balance, direction;
+    if (amtMatches.length >= 2) {
+      amount = amtMatches[0];
+      balance = amtMatches[amtMatches.length - 1];
+    } else {
+      amount = amtMatches[0];
+      balance = null;
+    }
+
+    // Direction detection rules (in priority order):
+    // 1. "From:" (money in) vs "To:" (money out) — strongest signal
+    // 2. Description keywords: "Payment from" / "Transfer from" / "top-up" → in; "Transfer to" / "withdrawal" → out
+    // 3. Default: out (most transactions on a typical statement are outgoings)
+    const descLower = description.toLowerCase();
+    if (counterpartyIs === 'From') {
+      direction = 'in';
+    } else if (counterpartyIs === 'To') {
+      direction = 'out';
+    } else if (/^(payment from|transfer from|apple pay top-up|pocket withdrawal)/i.test(description) ||
+               /^from\s/i.test(description)) {
+      direction = 'in';
+    } else if (/^(transfer to|to pocket|to john boyle|to social welfare|to adhd consult|cash withdrawal)/i.test(description)) {
+      direction = 'out';
+    } else {
+      direction = 'out';
+    }
+
+    // Detect internal (pocket / own-account / vault transfers)
+    const isInternal = /^(to pocket|pocket withdrawal|to john boyle|transfer to john boyle|from john boyle)/i.test(description);
+
+    // Build clean description
+    let cleanDesc = description;
+    if (extraDetail.trim() && cleanDesc.length < 30) {
+      cleanDesc = (cleanDesc + ' — ' + extraDetail.trim()).slice(0, 80);
+    }
+
+    results.push({
+      date: dateISO,
+      description: cleanDesc,
+      amount: amount,
+      direction: direction,
+      isInternal: isInternal,
+      balance: balance,
+    });
+
+    i = j - 1; // skip continuation lines we consumed
+  }
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// AIB PARSER — based on the official format published on aib.ie
+// ═══════════════════════════════════════════════════════════════
+// AIB statement format (official sample):
+//   - Date format: "06 June 2012" (DD MonthName YYYY)
+//   - Columns: Date | Details | Debit € | Credit € | Balance €
+//   - Date may appear ONCE for a group of transactions underneath it
+//     (so we track "current date" as we walk down lines)
+//   - Common prefixes: POS, ATM, OP/, *INET, DD, EFT, S/O, CREDIT TRANSFER
+//   - Overdrawn balances marked "dr" suffix (e.g. "189.50dr")
+//   - "BALANCE FORWARD" headers and "INTEREST CHARGED" sections to handle
+//
+// Returns array of: { date, description, amount, direction, isInternal, balance }
+function parseAIB(text) {
+  if (!text) return [];
+  let lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  const results = [];
+
+  // Detect end-of-statement footer sections we want to skip:
+  // "Uncleared Lodgements", "Outstanding Lodgements", "Pending Items", etc.
+  // These are not yet-settled transactions that will reappear in the next statement.
+  let mainEnd = lines.length;
+  for (let i = 0; i < lines.length; i++) {
+    if (/^(Uncleared|Outstanding|Pending)\s+(Lodgement|Item|Transaction|Payment)s?\b/i.test(lines[i])) {
+      mainEnd = i;
+      break;
+    }
+  }
+  lines = lines.slice(0, mainEnd);
+
+  // Date pattern: "06 June 2012" / "21 June 2012" / "5 December 2024"
+  const dateRegex = /^(\d{1,2})\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})\b/i;
+  const monthMap = {
+    january:0, february:1, march:2, april:3, may:4, june:5,
+    july:6, august:7, september:8, october:9, november:10, december:11
+  };
+
+  // Amount pattern: matches "40.00", "1,150.00", "189.50dr" (overdrawn)
+  // We capture the amount and whether it has the 'dr' suffix
+  const amountRegex = /([\d,]+\.\d{2})(dr)?/g;
+
+  // Lines we want to skip — header/footer noise that contains amounts but isn't a transaction
+  const skipPatterns = [
+    /^BALANCE\s+FORWARD/i,
+    /^INTEREST\s+(RATE|CHARGED)/i,
+    /^Lending\s+@/i,
+    /^\(?INCL\.\s+SURCHARGE/i,
+    /^Surcharges/i,
+    /^Authorised\s+Limit/i,
+    /^IBAN[:\s]/i,
+    /^BIC[:\s]/i,
+    /^Statement\s+of/i,
+    /^Account\s+(Name|Number|Fees)/i,
+    /^Branch$/i,
+    /^Date\s+Details/i,
+    /^Page\s+Number/i,
+    /^Telephone/i,
+    /^National\s+Sort/i,
+    /^Mr\.?\s+|^Ms\.?\s+|^Mrs\.?\s+|^Miss\s+/,
+    /^Allied\s+Irish\s+Banks/i,
+    /^For\s+Important\s+Information/i,
+    /^Thank\s+you/i,
+    /^www\.aib\.ie/i,
+    /^Add\s+more\s+green/i,
+    /^Switch\s+to\s+eStatements/i,
+    /^Terms\s+and\s+Conditions/i,
+    /^through\s+our\s+Internet/i,
+    /^banking\.$/i,
+    /^service\s+on/i,
+  ];
+
+  let currentDate = null; // sticky — AIB groups txns under one date
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Detect header skips
+    if (skipPatterns.some(p => p.test(line))) continue;
+
+    // Detect a date prefix
+    const dateMatch = line.match(dateRegex);
+    if (dateMatch) {
+      const [, day, monStr, year] = dateMatch;
+      const monIdx = monthMap[monStr.toLowerCase()];
+      if (monIdx !== undefined) {
+        currentDate = `${year}-${String(monIdx + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+      }
+      // Strip the date prefix off the line for processing the rest
+      line = line.replace(dateRegex, '').trim();
+      // Skip if nothing left (date was on its own line)
+      if (!line) continue;
+      // Skip if remaining is just header text (BALANCE FORWARD)
+      if (skipPatterns.some(p => p.test(line))) continue;
+    }
+
+    // Without a current date we can't make a transaction
+    if (!currentDate) continue;
+
+    // Extract amounts. AIB has up to 3 amounts per line: debit, credit, balance.
+    // The columns are POSITIONAL in the original PDF but pdf.js flattens to text.
+    // Heuristic for column inference:
+    //   - 1 amount: it's either debit OR credit (need direction from description)
+    //   - 2 amounts: usually [transaction_amount, balance]
+    //   - 3 amounts: [debit, credit, balance] OR multi-merge
+    const amtMatches = [...line.matchAll(amountRegex)].map(m => ({
+      value: parseFloat(m[1].replace(/,/g, '')),
+      isOverdrawn: !!m[2],
+      raw: m[0],
+      index: m.index,
+    }));
+
+    if (amtMatches.length === 0) continue;
+
+    // Description = part of line BEFORE the first amount
+    const firstAmtIdx = amtMatches[0].index;
+    let description = line.slice(0, firstAmtIdx).trim();
+
+    // Filter out very short / empty descriptions
+    if (description.length < 2) continue;
+
+    // Direction detection from description prefixes
+    const descUpper = description.toUpperCase();
+    let direction = null;
+
+    // Outgoings (debits) — definitive signals
+    const debitMarkers = ['POS ', 'ATM ', 'OP/', '*INET', 'DD ', 'S/O ', 'D/D ', 'OP ', 'STANDING ORDER', 'DIRECT DEBIT', 'WITHDRAWAL', 'PAYMENT TO', 'TRANSFER TO', 'INTEREST CHARGED', 'FEE', 'CHARGE'];
+    // Incomings (credits) — definitive signals
+    const creditMarkers = ['EFT ', 'CREDIT TRANSFER', 'LODGEMENT', 'LODGMENT', 'SALARY', 'DSFA', 'TRANSFER FROM', 'PAYMENT FROM', 'REFUND', 'CB EFT', 'WAGES', 'BENEFIT'];
+
+    if (debitMarkers.some(m => descUpper.startsWith(m) || descUpper.includes(' ' + m.trim() + ' '))) {
+      direction = 'out';
+    } else if (creditMarkers.some(m => descUpper.startsWith(m) || descUpper.includes(' ' + m.trim() + ' ') || descUpper.endsWith(' ' + m.trim()))) {
+      direction = 'in';
+    }
+    const hadMarker = direction !== null;
+
+    let amount, balance, balanceIsOverdrawn = false;
+    if (amtMatches.length === 1) {
+      // Single amount on the line — could be debit OR credit, depend on direction guess
+      amount = amtMatches[0].value;
+      balance = null;
+    } else if (amtMatches.length === 2) {
+      // Most common: [txn_amount, balance]
+      amount = amtMatches[0].value;
+      balance = amtMatches[1].value;
+      balanceIsOverdrawn = amtMatches[1].isOverdrawn;
+    } else {
+      // 3+ amounts: [debit, credit, balance] columnar layout
+      // The non-zero one of [0] / [1] is the actual amount
+      const a0 = amtMatches[0].value;
+      const a1 = amtMatches[1].value;
+      const lastAmt = amtMatches[amtMatches.length - 1];
+      balance = lastAmt.value;
+      balanceIsOverdrawn = lastAmt.isOverdrawn;
+      // If both first two are non-zero we can't tell — fall back to first
+      if (a0 > 0 && a1 === 0) {
+        amount = a0;
+        // Position-based: first amount column = debit
+        if (!direction) direction = 'out';
+      } else if (a0 === 0 && a1 > 0) {
+        amount = a1;
+        if (!direction) direction = 'in';
+      } else {
+        amount = a0;
+      }
+    }
+
+    // If direction still unknown, use heuristic fallback:
+    // most personal current account transactions are outgoings
+    if (!direction) direction = 'out';
+
+    // Normalize description — strip the prefix codes for cleaner display
+    let cleanDesc = description
+      .replace(/^POS\s+/i, '')
+      .replace(/^ATM\s+/i, 'ATM — ')
+      .replace(/^OP\/\s*/i, '')
+      .replace(/^OP\s+/i, '')
+      .replace(/^\*INET\s+/i, 'Internet — ')
+      .replace(/^DD\s+/i, '')
+      .replace(/^D\/D\s+/i, '')
+      .replace(/^S\/O\s+/i, '')
+      .replace(/^EFT\s+/i, '')
+      .replace(/^CREDIT TRANSFER\s*/i, 'Credit Transfer')
+      .trim();
+
+    if (cleanDesc.length === 0) cleanDesc = description;
+
+    // Detect internal-account transfers (similar to Revolut pockets)
+    const isInternal = /TO\s+SAVINGS|FROM\s+SAVINGS|INTERNAL\s+TRANSFER|TO\s+OWN\s+ACCOUNT/i.test(description);
+
+    results.push({
+      date: currentDate,
+      description: cleanDesc,
+      amount: amount,
+      direction: direction,
+      isInternal: isInternal,
+      balance: balance !== null && balanceIsOverdrawn ? -balance : balance,
+      _hadStrongMarker: hadMarker,
+    });
+  }
+
+  // ─── BALANCE RECONCILIATION PASS ─────────────────────────────
+  // pdf.js flattens columnar PDFs into linear text, so "Salary 2500" and
+  // "POS Tesco 40" look identical structurally. We use the running balance
+  // to retroactively fix direction.
+  //
+  // AIB groups multiple transactions under one balance line, so we collect
+  // all transactions between balance points and check the GROUP delta.
+  // If the group total signs don't reconcile, we look for ambiguous-direction
+  // entries (those without explicit credit/debit markers) and try flipping them.
+
+  let prevBalance = null;
+  let groupStart = 0;
+  for (let i = 0; i < results.length; i++) {
+    const r = results[i];
+    if (r.balance === null) continue;
+
+    // Compute expected delta = current_balance - prev_balance
+    if (prevBalance !== null) {
+      const groupRows = results.slice(groupStart, i + 1);
+      const expectedDelta = r.balance - prevBalance;
+
+      // Compute current group delta from our direction guesses
+      let computedDelta = 0;
+      for (const gr of groupRows) {
+        computedDelta += (gr.direction === 'in' ? gr.amount : -gr.amount);
+      }
+
+      // If group reconciles, we're good. Otherwise try flipping ambiguous rows.
+      if (Math.abs(computedDelta - expectedDelta) > 0.05) {
+        // Order rows for flipping: ambiguous (no strong marker) first,
+        // and within those LARGEST first (a single big mis-classification is more
+        // likely than many small ones — e.g. salary buried in a list of POS txns)
+        const tryOrder = groupRows
+          .map((gr, idx) => ({ idx: groupStart + idx, gr }))
+          .sort((a, b) => {
+            // Strong markers go last
+            const aStrong = a.gr._hadStrongMarker ? 1 : 0;
+            const bStrong = b.gr._hadStrongMarker ? 1 : 0;
+            if (aStrong !== bStrong) return aStrong - bStrong;
+            // Within same priority, larger amounts first
+            return b.gr.amount - a.gr.amount;
+          });
+
+        for (const { idx, gr } of tryOrder) {
+          const flipped = gr.direction === 'in' ? 'out' : 'in';
+          const newComputedDelta = computedDelta - (gr.direction === 'in' ? gr.amount : -gr.amount) + (flipped === 'in' ? gr.amount : -gr.amount);
+          if (Math.abs(newComputedDelta - expectedDelta) < Math.abs(computedDelta - expectedDelta)) {
+            results[idx].direction = flipped;
+            computedDelta = newComputedDelta;
+            if (Math.abs(computedDelta - expectedDelta) < 0.05) break;
+          }
+        }
+      }
+
+      groupStart = i + 1;
+    } else {
+      groupStart = i + 1;
+    }
+    prevBalance = r.balance;
+  }
+
+  return results;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// STATEMENT METADATA EXTRACTION
+// ═══════════════════════════════════════════════════════════════
+// Extract metadata from PDF text: opening balance, closing balance,
+// period start, period end, account-level totals if present.
+// Returns null fields where we can't find a value.
+function extractStatementMeta(text, bank) {
+  const meta = {
+    bank,
+    periodStart: null,
+    periodEnd: null,
+    openingBalance: null,
+    closingBalance: null,
+    declaredMoneyOut: null,
+    declaredMoneyIn: null,
+  };
+  if (!text) return meta;
+
+  // ─── REVOLUT METADATA ─────────────────────────────────────────
+  if (bank === 'revolut') {
+    // "from 1 February 2026 to 29 April 2026"
+    const periodMatch = text.match(/from\s+(\d{1,2}\s+\w+\s+\d{4})\s+to\s+(\d{1,2}\s+\w+\s+\d{4})/i);
+    if (periodMatch) {
+      meta.periodStart = parseDateString(periodMatch[1]);
+      meta.periodEnd = parseDateString(periodMatch[2]);
+    }
+    // Balance summary table — find the "Account (Current Account)" row OR the "Total" row
+    // Format: "Account (Current Account) €246.43 €7,280.71 €7,227.68 €193.40"
+    const accountRow = text.match(/Account\s*\(Current Account\)\s+€([\d,]+\.\d{2})\s+€([\d,]+\.\d{2})\s+€([\d,]+\.\d{2})\s+€([\d,]+\.\d{2})/i);
+    if (accountRow) {
+      meta.openingBalance = parseFloat(accountRow[1].replace(/,/g, ''));
+      meta.declaredMoneyOut = parseFloat(accountRow[2].replace(/,/g, ''));
+      meta.declaredMoneyIn = parseFloat(accountRow[3].replace(/,/g, ''));
+      meta.closingBalance = parseFloat(accountRow[4].replace(/,/g, ''));
+    }
+  }
+
+  // ─── AIB METADATA ─────────────────────────────────────────────
+  if (bank === 'aib') {
+    // "Date of Statement 21 June 2012" — single date statements; period is implicit
+    // BALANCE FORWARD line gives opening; last balance in last transaction is closing
+    const balanceForward = text.match(/(\d{1,2}\s+\w+\s+\d{4})\s+BALANCE\s+FORWARD\s+([\d,]+\.\d{2})(dr)?/i);
+    if (balanceForward) {
+      meta.periodStart = parseDateString(balanceForward[1]);
+      meta.openingBalance = (balanceForward[3] ? -1 : 1) * parseFloat(balanceForward[2].replace(/,/g, ''));
+    }
+    // Date of Statement
+    const dateOfStatement = text.match(/Date\s+of\s+Statement\s+(\d{1,2}\s+\w+\s+\d{4})/i);
+    if (dateOfStatement) {
+      meta.periodEnd = parseDateString(dateOfStatement[1]);
+    }
+    // AIB doesn't typically print declared money out/in totals in the same way Revolut does
+  }
+
+  // ─── BOI METADATA (best-effort, not yet structurally parsed) ─
+  if (bank === 'boi') {
+    const periodMatch = text.match(/(\d{1,2}\s+\w+\s+\d{4})\s+to\s+(\d{1,2}\s+\w+\s+\d{4})/i);
+    if (periodMatch) {
+      meta.periodStart = parseDateString(periodMatch[1]);
+      meta.periodEnd = parseDateString(periodMatch[2]);
+    }
+  }
+
+  return meta;
+}
+
+// Helper: parse "1 February 2026" or "21 June 2012" into ISO YYYY-MM-DD
+function parseDateString(s) {
+  if (!s) return null;
+  const months = { january:0,february:1,march:2,april:3,may:4,june:5,july:6,august:7,september:8,october:9,november:10,december:11,
+                   jan:0,feb:1,mar:2,apr:3,jun:5,jul:6,aug:7,sep:8,oct:9,nov:10,dec:11 };
+  const m = s.match(/(\d{1,2})\s+(\w+)\s+(\d{4})/);
+  if (!m) return null;
+  const monIdx = months[m[2].toLowerCase()];
+  if (monIdx === undefined) return null;
+  return `${m[3]}-${String(monIdx + 1).padStart(2, '0')}-${String(m[1]).padStart(2, '0')}`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PARSE VALIDATION
+// ═══════════════════════════════════════════════════════════════
+// Three independent checks. Returns confidence + list of issues.
+//   - 'high':   all checks pass cleanly
+//   - 'medium': at least one check failed but result is still usable
+//   - 'low':    serious mismatch — recommend retrying with a different parser
+function validateParse(structuredRows, meta) {
+  const issues = [];
+  let confidence = 'high';
+
+  if (!Array.isArray(structuredRows) || structuredRows.length === 0) {
+    return { confidence: 'low', issues: ['Parser returned no transactions.'], stats: {} };
+  }
+
+  // Compute parsed totals (excluding internal transfers — those are noise)
+  const visible = structuredRows.filter(r => !r.isInternal);
+  let parsedOut = 0, parsedIn = 0;
+  for (const r of visible) {
+    if (r.direction === 'out') parsedOut += r.amount;
+    else parsedIn += r.amount;
+  }
+  parsedOut = Math.round(parsedOut * 100) / 100;
+  parsedIn = Math.round(parsedIn * 100) / 100;
+
+  // ─── CHECK 1: BALANCE RECONCILIATION ─────────────────────────
+  let reconciled = null;
+  if (meta.openingBalance !== null && meta.closingBalance !== null) {
+    const expectedDelta = meta.closingBalance - meta.openingBalance;
+    const computedDelta = parsedIn - parsedOut;
+    const drift = Math.abs(expectedDelta - computedDelta);
+    reconciled = drift < 1.0; // allow €1 rounding tolerance
+    if (!reconciled) {
+      // If we have declared totals from the statement, compare against those instead — more precise
+      if (meta.declaredMoneyOut !== null && meta.declaredMoneyIn !== null) {
+        const outDrift = Math.abs(meta.declaredMoneyOut - parsedOut);
+        const inDrift = Math.abs(meta.declaredMoneyIn - parsedIn);
+        if (outDrift > 5.0 || inDrift > 5.0) {
+          confidence = 'low';
+          issues.push(`Money out drift €${outDrift.toFixed(2)} (declared €${meta.declaredMoneyOut}, parsed €${parsedOut}). Money in drift €${inDrift.toFixed(2)} (declared €${meta.declaredMoneyIn}, parsed €${parsedIn}).`);
+        } else if (outDrift > 1.0 || inDrift > 1.0) {
+          if (confidence === 'high') confidence = 'medium';
+          issues.push(`Minor drift on totals: money out €${outDrift.toFixed(2)}, money in €${inDrift.toFixed(2)}.`);
+        }
+      } else {
+        // Only have opening + closing balances
+        if (drift > 50) {
+          confidence = 'low';
+          issues.push(`Balance drift €${drift.toFixed(2)} (expected delta €${expectedDelta.toFixed(2)}, parsed delta €${computedDelta.toFixed(2)}).`);
+        } else if (drift > 5) {
+          if (confidence === 'high') confidence = 'medium';
+          issues.push(`Small balance drift €${drift.toFixed(2)}.`);
+        }
+      }
+    }
+  }
+
+  // ─── CHECK 2: TRANSACTION COUNT SANITY ───────────────────────
+  // If we have a period, scale expected count.
+  // Typical Irish current account: ~30-150 txns/month.
+  let expectedRange = null;
+  if (meta.periodStart && meta.periodEnd) {
+    const start = new Date(meta.periodStart);
+    const end = new Date(meta.periodEnd);
+    const days = Math.max(1, Math.round((end - start) / (1000 * 60 * 60 * 24)) + 1);
+    // ~1-5 visible txns per day is normal
+    expectedRange = { min: Math.max(1, Math.floor(days * 0.3)), max: Math.ceil(days * 8) };
+  } else {
+    expectedRange = { min: 1, max: 1000 };
+  }
+  if (visible.length < expectedRange.min) {
+    confidence = 'low';
+    issues.push(`Only ${visible.length} transactions parsed (expected at least ${expectedRange.min}).`);
+  } else if (visible.length > expectedRange.max) {
+    if (confidence === 'high') confidence = 'medium';
+    issues.push(`${visible.length} transactions parsed — higher than typical (expected up to ${expectedRange.max}). Possible duplicates.`);
+  }
+
+  // ─── CHECK 3: DATE RANGE SANITY ──────────────────────────────
+  if (meta.periodStart && meta.periodEnd) {
+    const dates = visible.map(r => r.date).filter(d => d).sort();
+    if (dates.length > 0) {
+      const earliest = dates[0];
+      const latest = dates[dates.length - 1];
+      // Allow 2 days slack on each side (statements sometimes include settlement-day spillover)
+      const startOk = earliest >= dateAddDays(meta.periodStart, -2);
+      const endOk = latest <= dateAddDays(meta.periodEnd, 2);
+      if (!startOk || !endOk) {
+        if (confidence === 'high') confidence = 'medium';
+        issues.push(`Some transactions fall outside statement period (${meta.periodStart} to ${meta.periodEnd}). Earliest: ${earliest}, latest: ${latest}.`);
+      }
+    }
+  }
+
+  // ─── CHECK 4: SALARY/INCOME PRESENCE (advisory only) ─────────
+  // Most statements have at least one credit. If zero credits found, that's suspicious.
+  const incomingCount = visible.filter(r => r.direction === 'in').length;
+  if (incomingCount === 0 && visible.length > 10) {
+    if (confidence === 'high') confidence = 'medium';
+    issues.push('No incoming transactions detected — verify direction parsing.');
+  }
+
+  return {
+    confidence,
+    issues,
+    stats: {
+      visibleCount: visible.length,
+      internalCount: structuredRows.length - visible.length,
+      parsedOut,
+      parsedIn,
+      reconciled,
+      expectedRange,
+    },
+  };
+}
+
+// Helper: add days to an ISO date string
+function dateAddDays(isoDate, days) {
+  const d = new Date(isoDate);
+  d.setDate(d.getDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CONVERT structured rows -> the legacy {date, description, amount} format
+// the frontend expects. Negative amount = outgoing.
+// ═══════════════════════════════════════════════════════════════
+function structuredToLegacyRows(structured, opts = {}) {
+  const includeInternal = opts.includeInternal === true;
+  return structured
+    .filter(r => includeInternal || !r.isInternal)
+    .map(r => ({
+      date: r.date,
+      description: r.description,
+      amount: String(r.direction === 'out' ? -Math.abs(r.amount) : Math.abs(r.amount)),
+    }));
+}
+
 // ── PDF PARSE ENDPOINT ──
 const PDF_PARSE_PROMPT = `You are a bank statement parser. The user will give you raw text extracted from a bank statement PDF.
 Your job is to find every transaction and return them as a JSON array.
@@ -864,9 +1672,82 @@ app.post('/parse-pdf', softAuth, rateLimit, async (req, res) => {
   if (!text || typeof text !== 'string') {
     return res.status(400).json({ error: 'Missing text field.' });
   }
-  if (text.length > 15000) {
+  if (text.length > 80000) {
     return res.status(400).json({ error: 'Text too long.' });
   }
+
+  // ─── BANK DETECTION + STRUCTURAL PARSE ─────────────────────────
+  const bank = detectBank(text);
+  console.log(`[parse-pdf] Detected bank: ${bank}`);
+
+  if (bank === 'revolut') {
+    try {
+      const structured = parseRevolut(text);
+      if (structured.length > 0) {
+        const meta = extractStatementMeta(text, 'revolut');
+        const validation = validateParse(structured, meta);
+        const rows = structuredToLegacyRows(structured, { includeInternal: false });
+        const internalCount = structured.filter(r => r.isInternal).length;
+        console.log(`[parse-pdf] Revolut: ${rows.length} txns (+${internalCount} internal) | confidence=${validation.confidence}${validation.issues.length ? ' | issues: ' + validation.issues.join('; ') : ''}`);
+
+        // If confidence is low, fall through to AI fallback to retry
+        if (validation.confidence === 'low') {
+          console.log('[parse-pdf] Revolut validation FAILED — falling back to AI');
+        } else {
+          return res.json({
+            rows,
+            source: 'revolut-structural',
+            validation,
+            stats: {
+              total: structured.length,
+              visible: rows.length,
+              internalHidden: internalCount,
+              ...validation.stats,
+            }
+          });
+        }
+      } else {
+        console.log('[parse-pdf] Revolut detected but parser returned 0 rows — falling back to AI');
+      }
+    } catch (e) {
+      console.warn('[parse-pdf] Revolut parser threw:', e.message, '— falling back to AI');
+    }
+  }
+
+  if (bank === 'aib') {
+    try {
+      const structured = parseAIB(text);
+      if (structured.length > 0) {
+        const meta = extractStatementMeta(text, 'aib');
+        const validation = validateParse(structured, meta);
+        const rows = structuredToLegacyRows(structured, { includeInternal: false });
+        const internalCount = structured.filter(r => r.isInternal).length;
+        console.log(`[parse-pdf] AIB: ${rows.length} txns (+${internalCount} internal) | confidence=${validation.confidence}${validation.issues.length ? ' | issues: ' + validation.issues.join('; ') : ''}`);
+
+        if (validation.confidence === 'low') {
+          console.log('[parse-pdf] AIB validation FAILED — falling back to AI');
+        } else {
+          return res.json({
+            rows,
+            source: 'aib-structural',
+            validation,
+            stats: {
+              total: structured.length,
+              visible: rows.length,
+              internalHidden: internalCount,
+              ...validation.stats,
+            }
+          });
+        }
+      } else {
+        console.log('[parse-pdf] AIB detected but parser returned 0 rows — falling back to AI');
+      }
+    } catch (e) {
+      console.warn('[parse-pdf] AIB parser threw:', e.message, '— falling back to AI');
+    }
+  }
+
+  // ─── AI FALLBACK (for unknown banks / when structural parser fails) ───
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) {
     return res.status(500).json({ error: 'Server configuration error.' });
@@ -877,6 +1758,11 @@ app.post('/parse-pdf', softAuth, rateLimit, async (req, res) => {
     const entries = Object.entries(cache).slice(0, 200);
     communityMappings = '\n\nCOMMUNITY DECODED MERCHANTS (highest priority — use these first):\n' +
       entries.map(([g, d]) => `"${g}" = ${d}`).join('\n');
+  }
+  // Bank-specific hint to help the AI parser
+  let bankHint = '';
+  if (bank !== 'unknown') {
+    bankHint = `\n\nDETECTED BANK: ${bank.toUpperCase()}\n` + getBankHint(bank);
   }
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
@@ -889,7 +1775,7 @@ app.post('/parse-pdf', softAuth, rateLimit, async (req, res) => {
       body: JSON.stringify({
         model: 'claude-sonnet-4-20250514',
         max_tokens: 6000,
-        system: PDF_PARSE_PROMPT + communityMappings,
+        system: PDF_PARSE_PROMPT + communityMappings + bankHint,
         messages: [{ role: 'user', content: `Bank statement text:\n\n${text}` }],
       }),
     });
@@ -1745,8 +2631,35 @@ app.post('/categorise', softAuth, rateLimit, async (req, res) => {
   if (!merchants || !Array.isArray(merchants) || merchants.length === 0) {
     return res.status(400).json({ error: 'Missing merchants array.' });
   }
+
+  // ─── PHASE 1: LIBRARY LOOKUP ──────────────────────────────────
+  // For each merchant, check the library first. Only fall through to AI for unknowns.
+  await loadMerchantLibrary();
+  const categories = {};
+  const unknowns = [];
+  let libHits = 0;
+  for (const m of merchants) {
+    const hit = lookupMerchant(m);
+    if (hit && hit.category) {
+      categories[m] = hit.category;
+      libHits++;
+    } else {
+      unknowns.push(m);
+    }
+  }
+  console.log(`[categorise] library hits: ${libHits}/${merchants.length}, AI calls needed: ${unknowns.length}`);
+
+  // If everything was in the library, we can skip AI entirely (€0 categorisation!)
+  if (unknowns.length === 0) {
+    return res.json({ categories, source: 'library-only', stats: { libHits, aiCalls: 0 } });
+  }
+
+  // ─── PHASE 2: AI FALLBACK FOR UNKNOWNS ────────────────────────
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) return res.status(500).json({ error: 'Server configuration error.' });
+  if (!apiKey) {
+    // Return what we have from the library if AI is down
+    return res.json({ categories, source: 'library-partial', stats: { libHits, aiCalls: 0 } });
+  }
   const CATS = ['Groceries','Food delivery','Takeaways','Pubs & bars','Coffee','Eating out','Taxis','Public transport','Petrol & parking','Travel','Subscriptions','Gaming','Clothing','Health','Fitness','Shopping','Rent & bills','Cash withdrawal','Transfers','Income','Other'];
   const prompt = `You are a transaction categoriser for Irish bank statements. You know Irish merchants well.
 Given a list of merchant/transaction names, return a JSON object mapping each merchant to its category.
@@ -1771,13 +2684,13 @@ Irish context rules:
 - AIB transaction prefixes to strip: VDC, VDP, DD, CR, TFR, ATM before categorising
 - N26 merchant names are usually clean partner names — categorise directly
 - Salary, wages, payroll, employer name = Income
-- If genuinely unknown after best effort = Other
+- AGGRESSIVE CATEGORISATION: Pick the most likely category even if uncertain. ONLY use "Other" as a true last resort for genuinely incomprehensible strings.
 
 Return ONLY valid JSON, no markdown, no explanation.
 Example: {"Insomnia Drumcondra": "Coffee", "Circle K Swords": "Petrol & parking", "Sumup Taxi": "Taxis"}
 
 Merchants to categorise:
-${merchants.map((m, i) => `${i + 1}. ${m}`).join('\n')}`;
+${unknowns.map((m, i) => `${i + 1}. ${m}`).join('\n')}`;
   try {
     const response = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
@@ -1795,16 +2708,50 @@ ${merchants.map((m, i) => `${i + 1}. ${m}`).join('\n')}`;
     if (!response.ok) throw new Error('Anthropic error ' + response.status);
     const data = await response.json();
     const raw = data.content?.[0]?.text || '{}';
-    let categories = {};
+    let aiCategories = {};
     try {
-      categories = JSON.parse(raw.replace(/```json|```/g, '').trim());
+      aiCategories = JSON.parse(raw.replace(/```json|```/g, '').trim());
     } catch(e) {
       console.error('Categorise parse error:', e.message);
     }
-    res.json({ categories });
+
+    // Merge AI results with library hits
+    Object.assign(categories, aiCategories);
+
+    // ─── PHASE 3: SAVE AI RESULTS BACK TO LIBRARY ───────────────
+    // Fire-and-forget — don't block the response
+    for (const [merchant, cat] of Object.entries(aiCategories)) {
+      if (cat && CATS.includes(cat) && cat !== 'Other') {
+        // Only save high-confidence categorisations (skip "Other" — too noisy)
+        saveMerchantToLibrary(merchant, cat).catch(() => {});
+      }
+    }
+
+    res.json({
+      categories,
+      source: 'library+ai',
+      stats: { libHits, aiCalls: unknowns.length },
+    });
   } catch(err) {
     console.error('Categorise error:', err.message);
-    res.status(502).json({ error: 'Categorisation temporarily unavailable.' });
+    // Even if AI fails, return what the library gave us
+    res.json({
+      categories,
+      source: 'library-only-ai-failed',
+      stats: { libHits, aiCalls: 0, error: err.message },
+    });
   }
 });
 
+// ── MERCHANT CORRECTION ENDPOINT ──
+// Called when a user manually re-categorises a transaction in the UI.
+// Saves an anonymous correction record so we can detect community trends.
+app.post('/merchant-correction', softAuth, rateLimit, async (req, res) => {
+  const { merchant, suggestedCategory, correctedCategory } = req.body;
+  if (!merchant || !correctedCategory) {
+    return res.status(400).json({ error: 'Missing merchant or correctedCategory.' });
+  }
+  // Don't await — fire and forget
+  saveCorrection(merchant, suggestedCategory, correctedCategory).catch(() => {});
+  res.json({ ok: true });
+});
