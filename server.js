@@ -2755,3 +2755,131 @@ app.post('/merchant-correction', softAuth, rateLimit, async (req, res) => {
   saveCorrection(merchant, suggestedCategory, correctedCategory).catch(() => {});
   res.json({ ok: true });
 });
+
+// ═══════════════════════════════════════════════════════════════
+// COACH INSIGHTS — AI-generated observation cards for the dashboard
+// ═══════════════════════════════════════════════════════════════
+// The frontend sends a compact spending summary (not raw transactions).
+// We return 3 structured insight cards. Frontend caches by data fingerprint
+// in sessionStorage, so we typically get 1 call per upload per user session.
+
+const COACH_SYSTEM_PROMPT = `You are Skint, an Irish personal finance observer. You write short, punchy observations about a user's spending data — like a clever friend pointing out patterns they wouldn't have spotted themselves.
+
+CRITICAL RULES:
+- You generate observations, NOT advice. Never say "you should", "try to", "consider cutting", "we recommend". State what's there.
+- Use real numbers and merchant names from the data. Specificity is what makes this valuable.
+- Use Irish context: euro symbols, Dublin pubs cost €6-9 a pint, Tesco/Lidl/Aldi are normal grocers.
+- Keep each card body under 25 words. Cards are scannable, not paragraphs.
+- Tone is friendly, dry, occasionally cheeky — never preachy or American. Think Irish friend, not life coach.
+- Do NOT repeat what the rule-based insights already say (peak weekday, coffee vs groceries, savings rate %, yearly projection, subscription monthly total, small transactions count, unique merchant count, pub annualisation). You ADD to those, not repeat them.
+
+Find 3 observations the user genuinely wouldn't notice themselves. Look for:
+- Patterns across category + merchant combos ("3 of your top 5 spots are corner shops, not big shops")
+- Behavioural signals ("Your Tesco visits are top-ups not big shops — 14 visits at €38 average")
+- Specific merchant patterns or comparisons within the data
+- Surprising ratios within the data (NOT generic ones like coffee vs groceries — that's already covered)
+- Concentration patterns ("Half your delivery spend is from one place")
+
+Output ONLY valid JSON in this exact shape, nothing else:
+{"insights":[{"id":"unique-slug","title":"Short headline (4-7 words)","body":"The observation under 25 words","tone":"positive"|"warning"|"neutral","metric":"optional short tag like €240/yr"}]}
+
+Return exactly 3 insights.`;
+
+app.post('/coach-insights', rateLimit, async (req, res) => {
+  const { summary } = req.body;
+  if (!summary || typeof summary !== 'object') {
+    return res.status(400).json({ error: 'Missing summary field.' });
+  }
+
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json({ error: 'Server configuration error.' });
+  }
+
+  // Compact summary — keeps the prompt small and removes any PII
+  const compact = {
+    period_days: summary.daysInPeriod,
+    total_spent_eur: Math.round(summary.totalSpent || 0),
+    total_income_eur: Math.round(summary.totalIncome || 0),
+    net_eur: Math.round(summary.net || 0),
+    daily_avg_eur: Math.round(summary.dailyAvg || 0),
+    weekend_share_pct: Math.round((summary.weekendShare || 0) * 100),
+    personality: summary.personality,
+    top_categories: (summary.topCategories || []).slice(0, 6).map(c => ({
+      cat: c.category,
+      eur: Math.round(c.total),
+      share_pct: Math.round((c.share || 0) * 100),
+      txns: c.count,
+    })),
+    top_merchants: (summary.topMerchants || []).slice(0, 8).map(m => ({
+      name: m.merchant,
+      cat: m.category,
+      eur: Math.round(m.total),
+      visits: m.visits,
+    })),
+    subscriptions: (summary.subscriptions || []).slice(0, 8).map(s => ({
+      name: s.merchant,
+      monthly_eur: Math.round(s.monthly),
+      hits: s.occurrences,
+    })),
+    big_nights_count: summary.bigNightsCount || 0,
+    pub_spend_eur: Math.round(summary.pubSpend || 0),
+    delivery_spend_eur: Math.round(summary.deliverySpend || 0),
+    grocery_spend_eur: Math.round(summary.grocerySpend || 0),
+    coffee_spend_eur: Math.round(summary.coffeeSpend || 0),
+    weekday_peak: summary.weekdayPeak,
+  };
+
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 800,
+        system: COACH_SYSTEM_PROMPT,
+        messages: [
+          { role: 'user', content: `Spending data:\n${JSON.stringify(compact, null, 2)}` }
+        ],
+      }),
+    });
+
+    if (!response.ok) throw new Error('Anthropic error ' + response.status);
+    const data = await response.json();
+    const raw = data.content?.[0]?.text || '{}';
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(cleaned);
+    } catch (e) {
+      console.error('Coach parse error:', e.message, 'Raw:', raw.slice(0, 500));
+      return res.status(502).json({ error: 'Coach response invalid.' });
+    }
+
+    if (!Array.isArray(parsed.insights)) {
+      return res.status(502).json({ error: 'Coach response malformed.' });
+    }
+
+    const VALID_TONES = ['positive', 'warning', 'neutral'];
+    const insights = parsed.insights
+      .filter(i => i && i.id && i.title && i.body)
+      .map(i => ({
+        id: String(i.id).slice(0, 60),
+        title: String(i.title).slice(0, 80),
+        body: String(i.body).slice(0, 200),
+        tone: VALID_TONES.includes(i.tone) ? i.tone : 'neutral',
+        ...(i.metric ? { metric: String(i.metric).slice(0, 30) } : {}),
+      }))
+      .slice(0, 3);
+
+    res.json({ insights });
+  } catch (err) {
+    console.error('Coach error:', err.message);
+    res.status(502).json({ error: 'Coach temporarily unavailable.' });
+  }
+});
