@@ -228,6 +228,7 @@ app.use(cors({
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
 app.use((req, res, next) => {
+  // Stripe webhook needs raw body for signature verification — skip JSON parser
   if (req.originalUrl === '/stripe-webhook') return next();
   return express.json({ limit: '20mb' })(req, res, next);
 });
@@ -2595,12 +2596,11 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const subscriptionId = session.subscription;
     if (userId && SUPABASE_KEY) {
       try {
-      await supabaseRequest(`/profiles?id=eq.${userId}`, 'PATCH', {
+        await supabaseRequest(`/profiles?id=eq.${userId}`, 'PATCH', {
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           is_pro: true,
           updated_at: new Date().toISOString(),
-        });
         });
         console.log('User upgraded to Pro:', userId);
       } catch(e) {
@@ -2616,7 +2616,6 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
         await supabaseRequest(`/profiles?stripe_customer_id=eq.${customerId}`, 'PATCH', {
           is_pro: false,
           updated_at: new Date().toISOString(),
-        });
         });
         console.log('User downgraded from Pro:', customerId);
       } catch(e) {
