@@ -227,7 +227,10 @@ app.use(cors({
   },
   methods: ['GET', 'POST', 'OPTIONS'],
 }));
-app.use(express.json({ limit: '20mb' }));
+app.use((req, res, next) => {
+  if (req.originalUrl === '/stripe-webhook') return next();
+  return express.json({ limit: '20mb' })(req, res, next);
+});
 // ── SYSTEM PROMPT ──
 const SYSTEM_PROMPT = `You are Skint, an Irish personal finance information tool.
 Summarise what the user's spending data shows in plain, conversational language. Describe patterns factually — do not tell the user what to do, what they should cut, or give financial advice of any kind.
@@ -2592,11 +2595,12 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const subscriptionId = session.subscription;
     if (userId && SUPABASE_KEY) {
       try {
-        await supabaseRequest(`/user_data?user_id=eq.${userId}`, 'PATCH', {
+      await supabaseRequest(`/profiles?id=eq.${userId}`, 'PATCH', {
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           is_pro: true,
           updated_at: new Date().toISOString(),
+        });
         });
         console.log('User upgraded to Pro:', userId);
       } catch(e) {
@@ -2609,9 +2613,10 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const customerId = sub.customer;
     if (SUPABASE_KEY) {
       try {
-        await supabaseRequest(`/user_data?stripe_customer_id=eq.${customerId}`, 'PATCH', {
+        await supabaseRequest(`/profiles?stripe_customer_id=eq.${customerId}`, 'PATCH', {
           is_pro: false,
           updated_at: new Date().toISOString(),
+        });
         });
         console.log('User downgraded from Pro:', customerId);
       } catch(e) {
