@@ -2550,6 +2550,23 @@ function parseBankStatementText(text) {
     return true;
   });
 }
+// ── TAX SCAN ENDPOINT ──
+app.post('/tax-scan', softAuth, rateLimitParse, async (req, res) => {
+  const { transactions } = req.body;
+  if (!Array.isArray(transactions)) {
+    return res.status(400).json({ error: 'transactions array required' });
+  }
+  if (transactions.length > 5000) {
+    return res.status(400).json({ error: 'Too many transactions.' });
+  }
+  try {
+    const result = await runTaxScan(transactions, { supabaseRequest });
+    res.json(result);
+  } catch (err) {
+    console.error('Tax scan error:', err.message);
+    res.status(500).json({ error: 'Tax scan failed' });
+  }
+});
 // ── STRIPE CHECKOUT ──
 app.post('/create-checkout-session', requireAuth, rateLimitCheckout, async (req, res) => {
   if (!stripe) return res.status(500).json({ error: 'Stripe not configured.' });
@@ -2596,7 +2613,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const subscriptionId = session.subscription;
     if (userId && SUPABASE_KEY) {
       try {
-        await supabaseRequest(`/profiles?id=eq.${userId}`, 'PATCH', {
+       await supabaseRequest(`/user_data?user_id=eq.${userId}`, 'PATCH', {
           stripe_customer_id: customerId,
           stripe_subscription_id: subscriptionId,
           is_pro: true,
@@ -2613,7 +2630,7 @@ app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (re
     const customerId = sub.customer;
     if (SUPABASE_KEY) {
       try {
-        await supabaseRequest(`/profiles?stripe_customer_id=eq.${customerId}`, 'PATCH', {
+    await supabaseRequest(`/user_data?stripe_customer_id=eq.${customerId}`, 'PATCH', {
           is_pro: false,
           updated_at: new Date().toISOString(),
         });
