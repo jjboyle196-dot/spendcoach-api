@@ -397,6 +397,198 @@ async function softAuth(req, res, next) {
   next();
 }
 
+// ── REQUIRE PRO ─────────────────────────────────────────────
+// Must run AFTER requireAuth — checks the authenticated user has is_pro=true.
+async function requirePro(req, res, next) {
+  if (!req.user || !req.user.id) {
+    return res.status(401).json({ error: 'Authorization required.' });
+  }
+  if (!SUPABASE_KEY) {
+    return res.status(500).json({ error: 'Server Pro check not configured.' });
+  }
+  try {
+    const rows = await supabaseRequest(
+      `/user_data?user_id=eq.${req.user.id}&select=is_pro&limit=1`,
+      'GET'
+    );
+    const isPro = Array.isArray(rows) && rows[0] && rows[0].is_pro === true;
+    if (!isPro) {
+      return res.status(402).json({ error: 'Pro required.' });
+    }
+    req.isPro = true;
+    next();
+  } catch (e) {
+    console.error('Pro check failed:', e.message);
+    return res.status(503).json({ error: 'Pro check temporarily unavailable.' });
+  }
+}
+
+// ── PENNY (chat companion) ─────────────────────────────────────
+const PENNY_SYSTEM_PROMPT = `You are Penny, a warm reflective companion built into Skint, an Irish personal finance app. You talk with the user about their money — not as an advisor, but as a clever, calm friend who happens to know their numbers.
+
+WHO YOU TALK TO:
+Irish renters, mostly 22–35, saving for a deposit on a first home. They are busy, often anxious about money, and have heard enough lectures. They have uploaded their bank statements to Skint, which is how you know what you know.
+
+STRICT RULES (do not break these):
+- You reflect, you do not advise. Never say "you should", "try to", "consider cutting", "I recommend". State what is there. Ask a question. Let them decide.
+- Never recommend specific products, banks, accounts, investments, or services.
+- You are not a financial advisor. If the user asks for advice you cannot give (debt, investments, mortgage decisions), warmly redirect: "That one is worth a chat with a proper advisor — but I can show you what your numbers look like around it."
+- Never use the words "AI", "insights", "patterns", or "analysing" in your replies. You are a companion, not a feature.
+- Use euros (€). Use Irish context naturally — Dublin pubs charge €6–9 a pint, Tesco/Lidl/Aldi are the grocers, rent is the big one.
+- Keep replies short. Two or three sentences is usually plenty. No lectures. No bullet lists unless the user explicitly asks for one.
+- Tone: warm, dry, occasionally cheeky. Irish friend at a kitchen table, not American life coach. Never preachy.
+- Use the user's real numbers and merchants from the context block. Specificity is what makes you useful.
+- If the user is venting or anxious, acknowledge it before any numbers. Money is emotional.
+
+You will be given a FINANCIAL CONTEXT block summarising the user's recent spending. Treat it as reliable. If the user asks about something not in the context, say so honestly: "I cannot see that from here."`;
+
+const PENNY_MODEL = process.env.PENNY_MODEL || 'claude-haiku-4-5';
+const PENNY_MAX_TOKENS = Number(process.env.PENNY_MAX_TOKENS || 300);
+const PENNY_FREE_LIMIT = Number(process.env.PENNY_FREE_LIFETIME_LIMIT || 3);
+const PENNY_PRO_LIMIT = Number(process.env.PENNY_PRO_MONTHLY_LIMIT || 50);
+
+function pennyBuildContextBlock(summary) {
+  if (!summary || typeof summary !== 'object') {
+    return 'FINANCIAL CONTEXT:\n(No statement data available yet — the user has not uploaded a statement.)';
+  }
+  const lines = ['FINANCIAL CONTEXT (most recent statement period):'];
+  if (summary.daysInPeriod) lines.push(`Period: ${summary.daysInPeriod} days`);
+  if (summary.totalIncome != null) lines.push(`Income: €${Math.round(summary.totalIncome)}`);
+  if (summary.totalSpent != null) lines.push(`Spend: €${Math.round(summary.totalSpent)}`);
+  if (summary.net != null) lines.push(`Net: €${Math.round(summary.net)}`);
+  if (summary.dailyAvg != null) lines.push(`Daily average spend: €${Math.round(summary.dailyAvg)}`);
+  if (summary.personality) lines.push(`Spender profile: ${summary.personality}`);
+  if (Array.isArray(summary.topCategories) && summary.topCategories.length) {
+    const cats = summary.topCategories.slice(0, 5)
+      .map(c => `${c.category} €${Math.round(c.total)} (${c.count} txns)`).join(', ');
+    lines.push(`Top categories: ${cats}`);
+  }
+  if (Array.isArray(summary.topMerchants) && summary.topMerchants.length) {
+    const merch = summary.topMerchants.slice(0, 6)
+      .map(m => `${m.merchant} €${Math.round(m.total)} (${m.visits}x)`).join(', ');
+    lines.push(`Top merchants: ${merch}`);
+  }
+  if (Array.isArray(summary.subscriptions) && summary.subscriptions.length) {
+    const subs = summary.subscriptions.slice(0, 6)
+      .map(s => `${s.merchant} €${Math.round(s.monthly)}/mo`).join(', ');
+    lines.push(`Subscriptions: ${subs}`);
+  }
+  if (summary.pubSpend) lines.push(`Pub spend: €${Math.round(summary.pubSpend)}`);
+  if (summary.deliverySpend) lines.push(`Delivery spend: €${Math.round(summary.deliverySpend)}`);
+  if (summary.grocerySpend) lines.push(`Grocery spend: €${Math.round(summary.grocerySpend)}`);
+  if (summary.coffeeSpend) lines.push(`Coffee spend: €${Math.round(summary.coffeeSpend)}`);
+  return lines.join('\n');
+}
+
+function rateLimitPenny(req, res, next) {
+  const key = getRateLimitKey(req);
+  const result = checkRateLimit(key, 'penny', 5, 60 * 1000);
+  if (!result.allowed) {
+    return res.status(429).json({ error: 'Slow down a sec — Penny is catching up.' });
+  }
+  next();
+}
+
+app.post('/penny', requireAuth, rateLimitPenny, async (req, res) => {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) return res.status(500).json({ error: 'Server not configured.' });
+  if (!SUPABASE_KEY) return res.status(500).json({ error: 'Server not configured.' });
+
+  let row;
+  try {
+    const rows = await supabaseRequest(
+      `/user_data?user_id=eq.${req.user.id}&select=is_pro,penny_free_messages_used,penny_messages_this_month,penny_messages_month&limit=1`,
+      'GET'
+    );
+    row = (Array.isArray(rows) && rows[0]) ? rows[0] : {};
+  } catch (e) {
+    return res.status(503).json({ error: 'User check temporarily unavailable.' });
+  }
+
+  const isPro = row.is_pro === true;
+  const now = new Date();
+  const currentMonth = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
+
+  let used;
+  if (isPro) {
+    const sameMonth = row.penny_messages_month === currentMonth;
+    used = sameMonth ? Number(row.penny_messages_this_month || 0) : 0;
+    if (used >= PENNY_PRO_LIMIT) {
+      return res.status(429).json({
+        error: 'You have used a lot of Penny this month — she is resting until the 1st. The dashboard still has everything you need.'
+      });
+    }
+  } else {
+    used = Number(row.penny_free_messages_used || 0);
+    if (used >= PENNY_FREE_LIMIT) {
+      return res.status(402).json({ error: 'free_limit_reached' });
+    }
+  }
+
+  const { messages, summary } = req.body || {};
+  if (!Array.isArray(messages) || messages.length === 0) {
+    return res.status(400).json({ error: 'Missing messages.' });
+  }
+  if (messages.length > 30) {
+    return res.status(400).json({ error: 'Conversation too long.' });
+  }
+  const sanitized = messages
+    .filter(m => m && (m.role === 'user' || m.role === 'assistant')
+      && typeof m.content === 'string' && m.content.trim().length > 0)
+    .map(m => ({ role: m.role, content: String(m.content).slice(0, 2000) }));
+  if (sanitized.length === 0 || sanitized[sanitized.length - 1].role !== 'user') {
+    return res.status(400).json({ error: 'Last message must be from user.' });
+  }
+
+  const contextBlock = pennyBuildContextBlock(summary);
+  const withContext = sanitized.map((m, i) => {
+    if (i === 0 && m.role === 'user') {
+      return { role: 'user', content: `${contextBlock}\n\n---\n\n${m.content}` };
+    }
+    return m;
+  });
+
+  let reply;
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: PENNY_MODEL,
+        max_tokens: PENNY_MAX_TOKENS,
+        system: PENNY_SYSTEM_PROMPT,
+        messages: withContext,
+      }),
+    });
+    if (!response.ok) {
+      const err = await response.json().catch(() => ({}));
+      throw new Error(err.error?.message || `Anthropic error ${response.status}`);
+    }
+    const data = await response.json();
+    reply = data.content?.[0]?.text || '';
+  } catch (err) {
+    console.error('Penny model error:', err.message);
+    return res.status(502).json({ error: 'Penny is having a moment. Try again in a sec.' });
+  }
+
+  if (!reply) return res.status(502).json({ error: 'Empty reply.' });
+
+  const updateBody = isPro
+    ? { penny_messages_this_month: used + 1, penny_messages_month: currentMonth, updated_at: new Date().toISOString() }
+    : { penny_free_messages_used: used + 1, updated_at: new Date().toISOString() };
+  supabaseRequest(`/user_data?user_id=eq.${req.user.id}`, 'PATCH', updateBody)
+    .catch(e => console.error('Penny counter update failed:', e.message));
+
+  trackCost('coach');
+  const remaining = isPro
+    ? Math.max(0, PENNY_PRO_LIMIT - (used + 1))
+    : Math.max(0, PENNY_FREE_LIMIT - (used + 1));
+  res.json({ reply, remaining, isPro });
+});
 // ── COST GUARD ──
 let dailyCostTracker = { date: '', visionCalls: 0, coachCalls: 0, parseCalls: 0 };
 function trackCost(type) {
@@ -2597,11 +2789,13 @@ app.post('/create-checkout-session', requireAuth, rateLimitCheckout, async (req,
 app.post('/stripe-webhook', express.raw({ type: 'application/json' }), async (req, res) => {
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!webhookSecret) {
+    console.error('STRIPE_WEBHOOK_SECRET not set — refusing webhook');
+    return res.status(500).json({ error: 'Webhook not configured.' });
+  }
   let event;
   try {
-    event = webhookSecret
-      ? stripe.webhooks.constructEvent(req.body, sig, webhookSecret)
-      : JSON.parse(req.body);
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
   } catch (err) {
     console.error('Webhook signature error:', err.message);
     return res.status(400).json({ error: 'Webhook error.' });
@@ -2806,7 +3000,7 @@ Output ONLY valid JSON in this exact shape, nothing else:
 
 Return exactly 3 insights.`;
 
-app.post('/coach-insights', rateLimit, async (req, res) => {
+app.post('/coach-insights', requireAuth, requirePro, rateLimitCoach, async (req, res) => {
   const { summary } = req.body;
   if (!summary || typeof summary !== 'object') {
     return res.status(400).json({ error: 'Missing summary field.' });
